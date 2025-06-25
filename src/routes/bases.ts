@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { authenticate, authorize } from '../middleware/auth';
 import { logger } from '../utils/logger';
-import prisma from '../lib/prisma';
+import { query } from '../database/connection';
 
 const router = Router();
 
@@ -13,48 +13,57 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
     const { page = '1', limit = '10', is_active, commander_id } = req.query;
     const offset = (parseInt(page as string) - 1) * parseInt(limit as string);
     
-    // Build where conditions for Prisma
-    const where: any = {};
+    // Build where conditions
+    let whereClause = 'WHERE 1=1';
+    const params: any[] = [];
+    let paramIndex = 1;
 
     // Add status filter
     if (is_active !== undefined && is_active !== '') {
-      where.is_active = is_active === 'true';
+      whereClause += ` AND b.is_active = $${paramIndex}`;
+      params.push(is_active === 'true');
+      paramIndex++;
     } else {
       // Default to active bases only
-      where.is_active = true;
+      whereClause += ` AND b.is_active = $${paramIndex}`;
+      params.push(true);
+      paramIndex++;
     }
 
     // Add commander filter
     if (commander_id && commander_id !== '') {
-      where.commander_id = commander_id as string;
+      whereClause += ` AND b.commander_id = $${paramIndex}`;
+      params.push(commander_id);
+      paramIndex++;
     }
 
     // Get total count
-    const total = await prisma.bases.count({ where });
+    const countQuery = `SELECT COUNT(*) FROM bases b ${whereClause}`;
+    const countResult = await query(countQuery, params);
+    const total = parseInt(countResult.rows[0].count);
 
     // Get paginated results with commander information
-    const bases = await prisma.bases.findMany({
-      where,
-      include: {
-        users_bases_commander_idTousers: {
-          select: {
-            first_name: true,
-            last_name: true
-          }
-        }
-      },
-      orderBy: {
-        name: 'asc'
-      },
-      take: parseInt(limit as string),
-      skip: offset
-    });
+    const basesQuery = `
+      SELECT 
+        b.*,
+        u.first_name,
+        u.last_name
+      FROM bases b
+      LEFT JOIN users u ON b.commander_id = u.id
+      ${whereClause}
+      ORDER BY b.name ASC
+      LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
+    `;
+    params.push(parseInt(limit as string), offset);
+    
+    const basesResult = await query(basesQuery, params);
+    const bases = basesResult.rows;
 
     // Transform data to match expected format
     const transformedBases = bases.map(base => ({
       ...base,
-      first_name: base.users_bases_commander_idTousers?.first_name || null,
-      last_name: base.users_bases_commander_idTousers?.last_name || null
+      first_name: base.first_name || null,
+      last_name: base.last_name || null
     }));
 
     return res.json({
