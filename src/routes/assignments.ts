@@ -127,7 +127,7 @@ router.post('/', authenticate, authorize('admin', 'base_commander', 'logistics_o
 
     // Check if asset exists and has sufficient quantity
     const assetResult = await query(
-      'SELECT quantity, available_quantity FROM assets WHERE name = $1 AND base_id = $2',
+      'SELECT quantity, available_quantity, assigned_quantity FROM assets WHERE name = $1 AND base_id = $2',
       [asset_name, base_id]
     );
 

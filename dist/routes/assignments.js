@@ -100,7 +100,7 @@ router.post('/', auth_1.authenticate, (0, auth_1.authorize)('admin', 'base_comma
                 error: 'Base commanders can only create assignments for their base'
             });
         }
-        const assetResult = await (0, connection_1.query)('SELECT quantity, available_quantity FROM assets WHERE name = $1 AND base_id = $2', [asset_name, base_id]);
+        const assetResult = await (0, connection_1.query)('SELECT quantity, available_quantity, assigned_quantity FROM assets WHERE name = $1 AND base_id = $2', [asset_name, base_id]);
         if (assetResult.rows.length === 0) {
             return res.status(404).json({
                 success: false,
