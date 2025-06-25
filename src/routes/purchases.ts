@@ -1,5 +1,5 @@
 import { Router, Response } from 'express';
-import prisma from '../lib/prisma';
+import { query } from '../database/connection';
 import { authenticate, authorize } from '../middleware/auth';
 import { logger } from '../utils/logger';
 import { AuthenticatedRequest } from '../types';
@@ -14,72 +14,67 @@ router.get('/', authenticate, async (req: AuthenticatedRequest, res: Response) =
     const { base_id, asset_name, start_date, end_date, page = 1, limit = 10 } = req.query;
     
     // Build where conditions
-    const whereConditions: any = {};
+    let whereClause = 'WHERE 1=1';
+    const params: any[] = [];
+    let paramIndex = 1;
 
     // Apply filters based on user role
     if (req.user!.role === 'base_commander' && req.user!.base_id) {
-      whereConditions.base_id = req.user!.base_id;
+      whereClause += ` AND p.base_id = $${paramIndex}`;
+      params.push(req.user!.base_id);
+      paramIndex++;
     } else if (base_id && req.user!.role !== 'admin') {
-      whereConditions.base_id = base_id as string;
+      whereClause += ` AND p.base_id = $${paramIndex}`;
+      params.push(base_id as string);
+      paramIndex++;
     }
 
     if (asset_name) {
-      whereConditions.assets = {
-        name: {
-          contains: asset_name as string,
-          mode: 'insensitive'
-        }
-      };
+      whereClause += ` AND a.name ILIKE $${paramIndex}`;
+      params.push(`%${asset_name}%`);
+      paramIndex++;
     }
 
     if (start_date && end_date) {
-      whereConditions.purchase_date = {
-        gte: new Date(start_date as string),
-        lte: new Date(end_date as string)
-      };
+      whereClause += ` AND p.purchase_date >= $${paramIndex} AND p.purchase_date <= $${paramIndex + 1}`;
+      params.push(start_date as string, end_date as string);
+      paramIndex += 2;
     }
 
     // Get total count
-    const total = await prisma.purchases.count({
-      where: whereConditions
-    });
+    const countQuery = `SELECT COUNT(*) FROM purchases p ${whereClause}`;
+    const countResult = await query(countQuery, params);
+    const total = parseInt(countResult.rows[0].count);
 
     // Get paginated results
     const offset = (parseInt(page as string) - 1) * parseInt(limit as string);
-    const purchases = await prisma.purchases.findMany({
-      where: whereConditions,
-      include: {
-        bases: {
-          select: {
-            name: true
-          }
-        },
-        users_purchases_created_byTousers: {
-          select: {
-            first_name: true,
-            last_name: true
-          }
-        },
-        assets: {
-          select: {
-            name: true
-          }
-        }
-      },
-      orderBy: {
-        purchase_date: 'desc'
-      },
-      take: parseInt(limit as string),
-      skip: offset
-    });
+    const purchasesQuery = `
+      SELECT 
+        p.*,
+        b.name as base_name,
+        u.first_name,
+        u.last_name,
+        a.name as asset_name
+      FROM purchases p
+      LEFT JOIN bases b ON p.base_id = b.id
+      LEFT JOIN users u ON p.created_by = u.id
+      LEFT JOIN assets a ON p.asset_id = a.id
+      ${whereClause}
+      ORDER BY p.purchase_date DESC
+      LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
+    `;
+    params.push(parseInt(limit as string), offset);
+    
+    const purchasesResult = await query(purchasesQuery, params);
+    const purchases = purchasesResult.rows;
 
     // Transform data to match expected format
-    const transformedPurchases = purchases.map(purchase => ({
+    const transformedPurchases = purchases.map((purchase: any) => ({
       ...purchase,
-      base_name: purchase.bases.name,
-      first_name: purchase.users_purchases_created_byTousers.first_name,
-      last_name: purchase.users_purchases_created_byTousers.last_name,
-      asset_name: purchase.assets.name
+      base_name: purchase.base_name,
+      first_name: purchase.first_name,
+      last_name: purchase.last_name,
+      asset_name: purchase.asset_name
     }));
 
     res.json({
@@ -135,20 +130,13 @@ router.post('/', authenticate, authorize('admin', 'base_commander'), async (req:
     // All purchases start as pending - only admins can approve them
     const status = 'pending';
 
-    const newPurchase = await prisma.purchases.create({
-      data: {
-        asset_id,
-        base_id,
-        quantity,
-        supplier: supplier || null,
-        purchase_date: new Date(purchase_date),
-        status,
-        approved_by: null,
-        approved_at: null,
-        notes: notes || null,
-        created_by: req.user!.user_id
-      }
-    });
+    const newPurchaseResult = await query(`
+      INSERT INTO purchases (asset_id, base_id, quantity, supplier, purchase_date, status, approved_by, approved_at, notes, created_by)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      RETURNING *
+    `, [asset_id, base_id, quantity, supplier || null, new Date(purchase_date), status, null, null, notes || null, req.user!.user_id]);
+
+    const newPurchase = newPurchaseResult.rows[0];
 
     // Log purchase creation
     logger.info({
@@ -182,16 +170,15 @@ router.put('/:id/approve', authenticate, authorize('admin'), async (req: Authent
     }
 
     // Check if purchase exists
-    const purchase = await prisma.purchases.findUnique({
-      where: { id }
-    });
-
-    if (!purchase) {
+    const purchaseResult = await query('SELECT * FROM purchases WHERE id = $1', [id]);
+    if (purchaseResult.rows.length === 0) {
       return res.status(404).json({
         success: false,
         error: 'Purchase not found'
       });
     }
+
+    const purchase = purchaseResult.rows[0];
 
     // Check if already approved
     if (purchase.status === 'approved') {
@@ -201,174 +188,115 @@ router.put('/:id/approve', authenticate, authorize('admin'), async (req: Authent
       });
     }
 
-    // Check if cancelled
-    if (purchase.status === 'cancelled') {
+    // Use database transaction
+    await query('BEGIN');
+    
+    try {
+      // Update purchase status
+      const updatedPurchaseResult = await query(`
+        UPDATE purchases 
+        SET status = $1, approved_by = $2, approved_at = $3
+        WHERE id = $4
+        RETURNING *
+      `, ['approved', req.user!.user_id, new Date(), id]);
+
+      const updatedPurchase = updatedPurchaseResult.rows[0];
+
+      // Add assets to inventory
+      await addAssetsToInventory(updatedPurchase);
+
+      await query('COMMIT');
+
+      // Log purchase approval
+      logger.info({
+        action: 'PURCHASE_APPROVED',
+        user_id: req.user!.user_id,
+        purchase_id: id,
+        asset_id: purchase.asset_id,
+        quantity: purchase.quantity
+      });
+
+      return res.json({
+        success: true,
+        data: updatedPurchase
+      });
+    } catch (error) {
+      await query('ROLLBACK');
+      throw error;
+    }
+  } catch (error) {
+    logger.error('Approve purchase error:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Server error'
+    });
+  }
+});
+
+// @route   PUT /api/purchases/:id/reject
+// @desc    Reject purchase request
+// @access  Private (Admin only)
+router.put('/:id/reject', authenticate, authorize('admin'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { id } = req.params;
+    const { reason } = req.body;
+
+    if (!id) {
       return res.status(400).json({
         success: false,
-        error: 'Cannot approve a cancelled purchase'
+        error: 'Purchase ID is required'
       });
     }
 
-    // Approve purchase
-    const approvedPurchase = await prisma.purchases.update({
-      where: { id },
-      data: {
-        status: 'approved',
-        approved_by: req.user!.user_id,
-        approved_at: new Date()
-      }
-    });
+    // Check if purchase exists
+    const purchaseResult = await query('SELECT * FROM purchases WHERE id = $1', [id]);
+    if (purchaseResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Purchase not found'
+      });
+    }
 
-    // Add assets to inventory
-    await addAssetsToInventory(approvedPurchase);
+    const purchase = purchaseResult.rows[0];
 
-    // Log purchase approval
+    // Check if already processed
+    if (purchase.status !== 'pending') {
+      return res.status(400).json({
+        success: false,
+        error: 'Purchase is already processed'
+      });
+    }
+
+    // Update purchase status
+    const updatedPurchaseResult = await query(`
+      UPDATE purchases 
+      SET status = $1, notes = $2
+      WHERE id = $3
+      RETURNING *
+    `, ['rejected', reason || 'Rejected by admin', id]);
+
+    const updatedPurchase = updatedPurchaseResult.rows[0];
+
+    // Log purchase rejection
     logger.info({
-      action: 'PURCHASE_APPROVED',
+      action: 'PURCHASE_REJECTED',
       user_id: req.user!.user_id,
       purchase_id: id,
       asset_id: purchase.asset_id,
-      quantity: purchase.quantity
+      quantity: purchase.quantity,
+      reason: reason || 'Rejected by admin'
     });
 
     return res.json({
       success: true,
-      data: approvedPurchase
+      data: updatedPurchase
     });
   } catch (error) {
-    logger.error('Approve purchase error:', error);
-    return res.status(500).json({ success: false, error: 'Server error' });
-  }
-});
-
-// @route   PUT /api/purchases/:id/cancel
-// @desc    Cancel purchase request
-// @access  Private (Admin, Base Commander)
-router.put('/:id/cancel', authenticate, authorize('admin', 'base_commander'), async (req: AuthenticatedRequest, res: Response) => {
-  try {
-    const { id } = req.params;
-
-    if (!id) {
-      return res.status(400).json({
-        success: false,
-        error: 'Purchase ID is required'
-      });
-    }
-
-    // Check if purchase exists
-    const purchase = await prisma.purchases.findUnique({
-      where: { id }
+    logger.error('Reject purchase error:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Server error'
     });
-
-    if (!purchase) {
-      return res.status(404).json({
-        success: false,
-        error: 'Purchase not found'
-      });
-    }
-
-    // Check if already cancelled
-    if (purchase.status === 'cancelled') {
-      return res.status(400).json({
-        success: false,
-        error: 'Purchase is already cancelled'
-      });
-    }
-
-    // Check if already approved
-    if (purchase.status === 'approved') {
-      return res.status(400).json({
-        success: false,
-        error: 'Cannot cancel an approved purchase'
-      });
-    }
-
-    // Check access permissions
-    if (req.user!.role === 'base_commander' && purchase.base_id !== req.user!.base_id) {
-      return res.status(403).json({
-        success: false,
-        error: 'Base commanders can only cancel purchases for their base'
-      });
-    }
-
-    // Cancel purchase
-    const cancelledPurchase = await prisma.purchases.update({
-      where: { id },
-      data: {
-        status: 'cancelled'
-      }
-    });
-
-    // Log purchase cancellation
-    logger.info({
-      action: 'PURCHASE_CANCELLED',
-      user_id: req.user!.user_id,
-      purchase_id: id
-    });
-
-    return res.json({
-      success: true,
-      data: cancelledPurchase
-    });
-  } catch (error) {
-    logger.error('Cancel purchase error:', error);
-    return res.status(500).json({ success: false, error: 'Server error' });
-  }
-});
-
-// @route   DELETE /api/purchases/:id
-// @desc    Delete purchase
-// @access  Private (Admin only)
-router.delete('/:id', authenticate, authorize('admin'), async (req: AuthenticatedRequest, res: Response) => {
-  try {
-    const { id } = req.params;
-
-    if (!id) {
-      return res.status(400).json({
-        success: false,
-        error: 'Purchase ID is required'
-      });
-    }
-
-    // Check if purchase exists
-    const purchase = await prisma.purchases.findUnique({
-      where: { id }
-    });
-
-    if (!purchase) {
-      return res.status(404).json({
-        success: false,
-        error: 'Purchase not found'
-      });
-    }
-
-    // Check if purchase is approved
-    if (purchase.status === 'approved') {
-      return res.status(400).json({
-        success: false,
-        error: 'Cannot delete an approved purchase'
-      });
-    }
-
-    // Delete purchase
-    await prisma.purchases.delete({
-      where: { id }
-    });
-
-    // Log purchase deletion
-    logger.info({
-      action: 'PURCHASE_DELETED',
-      user_id: req.user!.user_id,
-      purchase_id: id
-    });
-
-    return res.json({
-      success: true,
-      message: 'Purchase deleted successfully'
-    });
-  } catch (error) {
-    logger.error('Delete purchase error:', error);
-    return res.status(500).json({ success: false, error: 'Server error' });
   }
 });
 
@@ -378,7 +306,7 @@ router.delete('/:id', authenticate, authorize('admin'), async (req: Authenticate
 router.put('/:id', authenticate, authorize('admin', 'base_commander'), async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
-    const { asset_id, base_id, quantity, supplier, purchase_date, notes } = req.body;
+    const { quantity, supplier, purchase_date, notes } = req.body;
 
     if (!id) {
       return res.status(400).json({
@@ -387,143 +315,198 @@ router.put('/:id', authenticate, authorize('admin', 'base_commander'), async (re
       });
     }
 
-    // Validate required fields
-    if (!asset_id || !base_id || !quantity || !purchase_date) {
-      return res.status(400).json({
-        success: false,
-        error: 'Asset, base, quantity, and purchase date are required'
-      });
-    }
-
-    // Validate quantity
-    if (quantity <= 0) {
-      return res.status(400).json({
-        success: false,
-        error: 'Quantity must be greater than 0'
-      });
-    }
-
     // Check if purchase exists
-    const existingPurchase = await prisma.purchases.findUnique({
-      where: { id }
-    });
-
-    if (!existingPurchase) {
+    const purchaseResult = await query('SELECT * FROM purchases WHERE id = $1', [id]);
+    if (purchaseResult.rows.length === 0) {
       return res.status(404).json({
         success: false,
         error: 'Purchase not found'
       });
     }
 
+    const purchase = purchaseResult.rows[0];
+
     // Check access permissions
-    if (req.user!.role === 'base_commander') {
-      if (existingPurchase.base_id !== req.user!.base_id) {
-        return res.status(403).json({
-          success: false,
-          error: 'Base commanders can only edit purchases for their base'
-        });
-      }
-      if (existingPurchase.status === 'approved') {
-        return res.status(403).json({
-          success: false,
-          error: 'Cannot edit approved purchases'
-        });
-      }
+    if (req.user!.role === 'base_commander' && purchase.base_id !== req.user!.base_id) {
+      return res.status(403).json({
+        success: false,
+        error: 'Base commanders can only update purchases for their base'
+      });
+    }
+
+    // Cannot update approved purchases
+    if (purchase.status === 'approved') {
+      return res.status(400).json({
+        success: false,
+        error: 'Cannot update approved purchases'
+      });
     }
 
     // Update purchase
-    const updatedPurchase = await prisma.purchases.update({
-      where: { id },
-      data: {
-        asset_id,
-        base_id,
-        quantity,
-        supplier: supplier || null,
-        purchase_date: new Date(purchase_date),
-        notes: notes || null
-      }
-    });
+    const updateFields = [];
+    const updateValues = [];
+    let paramIndex = 1;
+
+    if (quantity !== undefined) {
+      updateFields.push(`quantity = $${paramIndex}`);
+      updateValues.push(quantity);
+      paramIndex++;
+    }
+
+    if (supplier !== undefined) {
+      updateFields.push(`supplier = $${paramIndex}`);
+      updateValues.push(supplier);
+      paramIndex++;
+    }
+
+    if (purchase_date !== undefined) {
+      updateFields.push(`purchase_date = $${paramIndex}`);
+      updateValues.push(new Date(purchase_date));
+      paramIndex++;
+    }
+
+    if (notes !== undefined) {
+      updateFields.push(`notes = $${paramIndex}`);
+      updateValues.push(notes);
+      paramIndex++;
+    }
+
+    if (updateFields.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'No fields to update'
+      });
+    }
+
+    updateValues.push(id);
+    const updateQuery = `
+      UPDATE purchases 
+      SET ${updateFields.join(', ')}
+      WHERE id = $${paramIndex}
+      RETURNING *
+    `;
+
+    const updatedPurchaseResult = await query(updateQuery, updateValues);
+    const updatedPurchase = updatedPurchaseResult.rows[0];
 
     // Log purchase update
     logger.info({
       action: 'PURCHASE_UPDATED',
       user_id: req.user!.user_id,
       purchase_id: id,
-      asset_id,
-      quantity
+      changes: { quantity, supplier, purchase_date, notes }
     });
 
-    return res.json({ success: true, data: updatedPurchase });
+    return res.json({
+      success: true,
+      data: updatedPurchase
+    });
   } catch (error) {
     logger.error('Update purchase error:', error);
-    return res.status(500).json({ success: false, error: 'Server error' });
+    return res.status(500).json({
+      success: false,
+      error: 'Server error'
+    });
   }
 });
 
-// Helper function to add assets to inventory when purchase is approved
-async function addAssetsToInventory(purchase: { id: string; asset_id: string; base_id: string; quantity: number }) {
+// @route   DELETE /api/purchases/:id
+// @desc    Delete purchase
+// @access  Private (Admin, Base Commander)
+router.delete('/:id', authenticate, authorize('admin', 'base_commander'), async (req: AuthenticatedRequest, res: Response) => {
   try {
-    // First, get the asset name from the assets table using the asset_id
-    const asset = await prisma.assets.findUnique({
-      where: { id: purchase.asset_id }
-    });
+    const { id } = req.params;
 
-    if (!asset) {
-      throw new Error(`Asset with id ${purchase.asset_id} not found`);
-    }
-
-    const assetName = asset.name;
-
-    // Check if asset inventory already exists for this type and base
-    const existingAsset = await prisma.assets.findFirst({
-      where: {
-        name: assetName,
-        base_id: purchase.base_id
-      }
-    });
-
-    if (existingAsset) {
-      // Update existing inventory
-      const newQuantity = existingAsset.quantity + purchase.quantity;
-      const newAvailableQuantity = existingAsset.available_quantity + purchase.quantity;
-
-      await prisma.assets.update({
-        where: { id: existingAsset.id },
-        data: {
-          quantity: newQuantity,
-          available_quantity: newAvailableQuantity
-        }
-      });
-
-      logger.info({
-        action: 'ASSET_INVENTORY_UPDATED_FROM_PURCHASE',
-        purchase_id: purchase.id,
-        asset_id: existingAsset.id,
-        added_quantity: purchase.quantity,
-        new_total_quantity: newQuantity
-      });
-    } else {
-      // Create new inventory entry
-      const newAsset = await prisma.assets.create({
-        data: {
-          name: assetName,
-          base_id: purchase.base_id,
-          quantity: purchase.quantity,
-          available_quantity: purchase.quantity,
-          assigned_quantity: 0
-        }
-      });
-
-      logger.info({
-        action: 'ASSET_INVENTORY_CREATED_FROM_PURCHASE',
-        purchase_id: purchase.id,
-        asset_id: newAsset.id,
-        quantity: purchase.quantity
+    if (!id) {
+      return res.status(400).json({
+        success: false,
+        error: 'Purchase ID is required'
       });
     }
+
+    // Check if purchase exists
+    const purchaseResult = await query('SELECT * FROM purchases WHERE id = $1', [id]);
+    if (purchaseResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Purchase not found'
+      });
+    }
+
+    const purchase = purchaseResult.rows[0];
+
+    // Check access permissions
+    if (req.user!.role === 'base_commander' && purchase.base_id !== req.user!.base_id) {
+      return res.status(403).json({
+        success: false,
+        error: 'Base commanders can only delete purchases for their base'
+      });
+    }
+
+    // Cannot delete approved purchases
+    if (purchase.status === 'approved') {
+      return res.status(400).json({
+        success: false,
+        error: 'Cannot delete approved purchases'
+      });
+    }
+
+    // Delete purchase
+    await query('DELETE FROM purchases WHERE id = $1', [id]);
+
+    // Log purchase deletion
+    logger.info({
+      action: 'PURCHASE_DELETED',
+      user_id: req.user!.user_id,
+      purchase_id: id,
+      asset_id: purchase.asset_id,
+      quantity: purchase.quantity
+    });
+
+    return res.json({
+      success: true,
+      message: 'Purchase deleted successfully'
+    });
   } catch (error) {
-    logger.error('Error adding assets to inventory from purchase:', error);
-    throw error;
+    logger.error('Delete purchase error:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Server error'
+    });
+  }
+});
+
+// Helper function to add assets to inventory
+async function addAssetsToInventory(purchase: { id: string; asset_id: string; base_id: string; quantity: number }) {
+  // Check if asset already exists in inventory
+  const existingAssetResult = await query(
+    'SELECT * FROM assets WHERE id = $1 AND base_id = $2',
+    [purchase.asset_id, purchase.base_id]
+  );
+
+  if (existingAssetResult.rows.length > 0) {
+    // Update existing asset quantities
+    const existingAsset = existingAssetResult.rows[0];
+    const newQuantity = existingAsset.quantity + purchase.quantity;
+    const newAvailableQuantity = existingAsset.available_quantity + purchase.quantity;
+
+    // Update asset status based on new quantity
+    let newStatus = 'available';
+    if (newAvailableQuantity === 0) {
+      newStatus = 'low_stock';
+    }
+
+    await query(`
+      UPDATE assets 
+      SET quantity = $1, available_quantity = $2, status = $3
+      WHERE id = $4
+    `, [newQuantity, newAvailableQuantity, newStatus, existingAsset.id]);
+  } else {
+    // Create new asset entry
+    await query(`
+      INSERT INTO assets (id, base_id, quantity, available_quantity, assigned_quantity, status)
+      VALUES ($1, $2, $3, $3, 0, 'available')
+    `, [purchase.asset_id, purchase.base_id, purchase.quantity]);
   }
 }
 

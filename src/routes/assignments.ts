@@ -2,7 +2,6 @@ import { Router, Request, Response } from 'express';
 import { query } from '../database/connection';
 import { authenticate, authorize } from '../middleware/auth';
 import { logger } from '../utils/logger';
-import sql from '../database/db';
 
 const router = Router();
 
@@ -164,15 +163,17 @@ router.post('/', authenticate, authorize('admin', 'base_commander', 'logistics_o
       });
     }
 
-    // Start transaction using sql.begin()
-    const transaction = await sql.begin(async (sql) => {
+    // Use database transaction
+    await query('BEGIN');
+    
+    try {
       // Create assignment
       const createQuery = `
         INSERT INTO assignments (asset_name, assigned_to, assigned_by, base_id, quantity, assignment_date, notes)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
         RETURNING *
       `;
-      const result = await sql.unsafe(createQuery, [
+      const result = await query(createQuery, [
         asset_name,
         assigned_to,
         req.user!.user_id,
@@ -182,7 +183,7 @@ router.post('/', authenticate, authorize('admin', 'base_commander', 'logistics_o
         notes || null
       ]);
 
-      const newAssignment = result[0];
+      const newAssignment = result.rows[0];
 
       // Update asset quantities - ensure we use valid numbers
       const availableQuantity = parseInt(asset.available_quantity) || 0;
@@ -194,41 +195,32 @@ router.post('/', authenticate, authorize('admin', 'base_commander', 'logistics_o
       console.log('Original available:', availableQuantity, 'Original assigned:', assignedQuantity);
       console.log('New available:', newAvailableQuantity, 'New assigned:', newAssignedQuantity);
 
-      await sql.unsafe(`
+      await query(`
         UPDATE assets 
         SET available_quantity = $1, assigned_quantity = $2
         WHERE name = $3 AND base_id = $4
       `, [newAvailableQuantity, newAssignedQuantity, asset_name, base_id]);
 
-      // Update asset status based on remaining available quantity
-      let newStatus = 'available';
-      if (newAvailableQuantity === 0) {
-        newStatus = 'low_stock';
-      }
+      await query('COMMIT');
 
-      await sql.unsafe(`
-        UPDATE assets 
-        SET status = $1
-        WHERE name = $2 AND base_id = $3
-      `, [newStatus, asset_name, base_id]);
+      // Log assignment creation
+      logger.info({
+        action: 'ASSIGNMENT_CREATED',
+        user_id: req.user!.user_id,
+        assignment_id: newAssignment.id,
+        asset_name: asset_name,
+        assigned_to: assigned_to,
+        quantity: validQuantity
+      });
 
-      return newAssignment;
-    });
-
-    // Log assignment creation
-    logger.info({
-      action: 'ASSIGNMENT_CREATED',
-      user_id: req.user!.user_id,
-      assignment_id: transaction?.['id'],
-      asset_name,
-      assigned_to,
-      quantity
-    });
-
-    return res.status(201).json({
-      success: true,
-      data: transaction
-    });
+      return res.status(201).json({
+        success: true,
+        data: newAssignment
+      });
+    } catch (error) {
+      await query('ROLLBACK');
+      throw error;
+    }
   } catch (error) {
     logger.error('Create assignment error:', error);
     return res.status(500).json({
@@ -384,21 +376,23 @@ router.delete('/:id', authenticate, authorize('admin', 'base_commander'), async 
     }
 
     // Start transaction using sql.begin()
-    await sql.begin(async (sql) => {
+    await query('BEGIN');
+    
+    try {
       // Restore asset quantities if assignment is active
       if (assignment.status === 'active') {
-        const assetResult = await sql.unsafe(
+        const assetResult = await query(
           'SELECT quantity, available_quantity, assigned_quantity FROM assets WHERE name = $1 AND base_id = $2',
           [assignment.asset_name, assignment.base_id]
         );
 
-        if (assetResult.length > 0) {
-          const asset = assetResult[0];
+        if (assetResult.rows.length > 0) {
+          const asset = assetResult.rows[0];
           if (asset) {
             const newAvailableQuantity = asset['available_quantity'] + assignment.quantity;
             const newAssignedQuantity = asset['assigned_quantity'] - assignment.quantity;
 
-            await sql.unsafe(`
+            await query(`
               UPDATE assets 
               SET available_quantity = $1, assigned_quantity = $2
               WHERE name = $3 AND base_id = $4
@@ -408,22 +402,29 @@ router.delete('/:id', authenticate, authorize('admin', 'base_commander'), async 
       }
 
       // Delete assignment
-      await sql.unsafe('DELETE FROM assignments WHERE id = $1', [id as string]);
-    });
+      await query(`
+        DELETE FROM assignments WHERE id = $1
+      `, [id]);
 
-    // Log assignment deletion
-    logger.info({
-      action: 'ASSIGNMENT_DELETED',
-      user_id: req.user!.user_id,
-      assignment_id: id,
-      asset_name: assignment.asset_name,
-      quantity: assignment.quantity
-    });
+      await query('COMMIT');
 
-    return res.json({
-      success: true,
-      message: 'Assignment deleted successfully'
-    });
+      // Log assignment deletion
+      logger.info({
+        action: 'ASSIGNMENT_DELETED',
+        user_id: req.user!.user_id,
+        assignment_id: id,
+        asset_name: assignment.asset_name,
+        quantity: assignment.quantity
+      });
+
+      return res.json({
+        success: true,
+        message: 'Assignment deleted successfully'
+      });
+    } catch (error) {
+      await query('ROLLBACK');
+      throw error;
+    }
   } catch (error) {
     logger.error('Delete assignment error:', error);
     return res.status(500).json({
@@ -457,29 +458,30 @@ router.put('/:id/expend', authenticate, authorize('admin', 'base_commander', 'lo
     }
     
     // Start transaction using sql.begin()
-    await sql.begin(async (sql) => {
+    await query('BEGIN');
+    
+    try {
       // Update assignment
       const newExpended = assignment.expended_quantity + quantity;
       let newStatus = 'active';
       if (newExpended === assignment.quantity) newStatus = 'expended';
       else if (newExpended > 0) newStatus = 'partially_expended';
       
-      await sql.unsafe(
-        'UPDATE assignments SET expended_quantity = $1, status = $2, notes = COALESCE($3, notes) WHERE id = $4 RETURNING *',
-        [newExpended, newStatus, notes || null, id]
-      );
+      await query(`
+        UPDATE assignments SET expended_quantity = $1, status = $2, notes = COALESCE($3, notes) WHERE id = $4
+      `, [newExpended, newStatus, notes || null, id]);
       
       // Update asset quantities - remove from total inventory (consistent with expenditures page)
-      const assetResult = await sql.unsafe(
+      const assetResult = await query(
         'SELECT quantity, available_quantity, assigned_quantity FROM assets WHERE name = $1 AND base_id = $2',
         [assignment.asset_name, assignment.base_id]
       );
 
-      if (assetResult.length === 0) {
+      if (assetResult.rows.length === 0) {
         throw new Error('Asset record not found for this base and asset name');
       }
 
-      const asset = assetResult[0];
+      const asset = assetResult.rows[0];
       if (!asset) {
         throw new Error('Asset record not found for this base and asset name');
       }
@@ -493,10 +495,9 @@ router.put('/:id/expend', authenticate, authorize('admin', 'base_commander', 'lo
       }
 
       // Update asset quantities
-      await sql.unsafe(
-        'UPDATE assets SET quantity = $1, available_quantity = $2, assigned_quantity = $3 WHERE name = $4 AND base_id = $5',
-        [newQuantity, newAvailableQuantity, newAssignedQuantity, assignment.asset_name, assignment.base_id]
-      );
+      await query(`
+        UPDATE assets SET quantity = $1, available_quantity = $2, assigned_quantity = $3 WHERE name = $4 AND base_id = $5
+      `, [newQuantity, newAvailableQuantity, newAssignedQuantity, assignment.asset_name, assignment.base_id]);
 
       // Update asset status based on remaining quantity
       let assetNewStatus = 'available';
@@ -506,37 +507,40 @@ router.put('/:id/expend', authenticate, authorize('admin', 'base_commander', 'lo
         assetNewStatus = 'low_stock';
       }
 
-      await sql.unsafe(
-        'UPDATE assets SET status = $1 WHERE name = $2 AND base_id = $3',
-        [assetNewStatus, assignment.asset_name, assignment.base_id]
-      );
+      await query(`
+        UPDATE assets SET status = $1 WHERE name = $2 AND base_id = $3
+      `, [assetNewStatus, assignment.asset_name, assignment.base_id]);
 
       // Use the provided reason or fallback to default
       const expenditureReason = reason || 'Expended from assignment';
 
       // Create expenditure record
-      await sql.unsafe(
-        'INSERT INTO expenditures (asset_name, base_id, personnel_id, quantity, expenditure_date, reason, notes, created_by) VALUES ($1, $2, $3, $4, CURRENT_DATE, $5, $6, $7)',
-        [assignment.asset_name, assignment.base_id, assignment.assigned_to, quantity, expenditureReason, (notes as string) || null, req.user!.user_id]
-      );
-    });
-    
-    // Log expenditure from assignment
-    logger.info({
-      action: 'ASSIGNMENT_EXPENDED',
-      user_id: req.user!.user_id,
-      assignment_id: id,
-      asset_name: assignment.asset_name,
-      base_id: assignment.base_id,
-      personnel_id: assignment.assigned_to,
-      quantity,
-      reason: reason || 'Expended from assignment'
-    });
+      await query(`
+        INSERT INTO expenditures (asset_name, base_id, personnel_id, quantity, expenditure_date, reason, notes, created_by) VALUES ($1, $2, $3, $4, CURRENT_DATE, $5, $6, $7)
+      `, [assignment.asset_name, assignment.base_id, assignment.assigned_to, quantity, expenditureReason, (notes as string) || null, req.user!.user_id]);
 
-    return res.json({
-      success: true,
-      message: 'Asset expended successfully'
-    });
+      await query('COMMIT');
+
+      // Log expenditure from assignment
+      logger.info({
+        action: 'ASSIGNMENT_EXPENDED',
+        user_id: req.user!.user_id,
+        assignment_id: id,
+        asset_name: assignment.asset_name,
+        base_id: assignment.base_id,
+        personnel_id: assignment.assigned_to,
+        quantity,
+        reason: reason || 'Expended from assignment'
+      });
+
+      return res.json({
+        success: true,
+        message: 'Asset expended successfully'
+      });
+    } catch (error) {
+      await query('ROLLBACK');
+      throw error;
+    }
   } catch (error) {
     logger.error('Expend assignment error:', error);
     return res.status(500).json({

@@ -1,5 +1,5 @@
 import { Router, Response } from 'express';
-import prisma from '../lib/prisma';
+import { query } from '../database/connection';
 import { authenticate, authorize } from '../middleware/auth';
 import { logger } from '../utils/logger';
 import { AuthenticatedRequest } from '../types';
@@ -14,76 +14,75 @@ router.get('/', authenticate, async (req: AuthenticatedRequest, res: Response) =
     const { base_id, asset_name, start_date, end_date, page = 1, limit = 10 } = req.query;
     
     // Build where conditions
-    const whereConditions: any = {};
+    let whereClause = 'WHERE 1=1';
+    const params: any[] = [];
+    let paramIndex = 1;
 
     // Apply filters based on user role
     if (req.user!.role === 'base_commander' && req.user!.base_id) {
-      whereConditions.base_id = req.user!.base_id;
+      whereClause += ` AND e.base_id = $${paramIndex}`;
+      params.push(req.user!.base_id);
+      paramIndex++;
     } else if (req.user!.role === 'logistics_officer' && req.user!.base_id) {
-      whereConditions.base_id = req.user!.base_id;
+      whereClause += ` AND e.base_id = $${paramIndex}`;
+      params.push(req.user!.base_id);
+      paramIndex++;
     } else if (base_id) {
-      whereConditions.base_id = base_id as string;
+      whereClause += ` AND e.base_id = $${paramIndex}`;
+      params.push(base_id as string);
+      paramIndex++;
     }
 
     if (asset_name) {
-      whereConditions.asset_name = {
-        contains: asset_name as string,
-        mode: 'insensitive'
-      };
+      whereClause += ` AND e.asset_name ILIKE $${paramIndex}`;
+      params.push(`%${asset_name}%`);
+      paramIndex++;
     }
 
     if (start_date && end_date) {
-      whereConditions.expenditure_date = {
-        gte: new Date(start_date as string),
-        lte: new Date(end_date as string)
-      };
+      whereClause += ` AND e.expenditure_date >= $${paramIndex} AND e.expenditure_date <= $${paramIndex + 1}`;
+      params.push(start_date as string, end_date as string);
+      paramIndex += 2;
     }
 
     // Get total count
-    const total = await prisma.expenditures.count({
-      where: whereConditions
-    });
+    const countQuery = `SELECT COUNT(*) FROM expenditures e ${whereClause}`;
+    const countResult = await query(countQuery, params);
+    const total = parseInt(countResult.rows[0].count);
 
     // Get paginated results
     const offset = (parseInt(page as string) - 1) * parseInt(limit as string);
-    const expenditures = await prisma.expenditures.findMany({
-      where: whereConditions,
-      include: {
-        bases: {
-          select: {
-            name: true
-          }
-        },
-        users_expenditures_created_byTousers: {
-          select: {
-            first_name: true,
-            last_name: true
-          }
-        },
-        personnel: {
-          select: {
-            first_name: true,
-            last_name: true,
-            rank: true
-          }
-        }
-      },
-      orderBy: {
-        expenditure_date: 'desc'
-      },
-      take: parseInt(limit as string),
-      skip: offset
-    });
+    const expendituresQuery = `
+      SELECT 
+        e.*,
+        b.name as base_name,
+        u.first_name,
+        u.last_name,
+        p.first_name as personnel_first_name,
+        p.last_name as personnel_last_name,
+        p.rank as personnel_rank
+      FROM expenditures e
+      LEFT JOIN bases b ON e.base_id = b.id
+      LEFT JOIN users u ON e.created_by = u.id
+      LEFT JOIN personnel p ON e.personnel_id = p.id
+      ${whereClause}
+      ORDER BY e.expenditure_date DESC
+      LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
+    `;
+    params.push(parseInt(limit as string), offset);
+    
+    const expendituresResult = await query(expendituresQuery, params);
+    const expenditures = expendituresResult.rows;
 
     // Transform data to match expected format
-    const transformedExpenditures = expenditures.map(expenditure => ({
+    const transformedExpenditures = expenditures.map((expenditure: any) => ({
       ...expenditure,
-      base_name: expenditure.bases.name,
-      first_name: expenditure.users_expenditures_created_byTousers.first_name,
-      last_name: expenditure.users_expenditures_created_byTousers.last_name,
-      personnel_first_name: expenditure.personnel?.first_name || null,
-      personnel_last_name: expenditure.personnel?.last_name || null,
-      personnel_rank: expenditure.personnel?.rank || null
+      base_name: expenditure.base_name,
+      first_name: expenditure.first_name,
+      last_name: expenditure.last_name,
+      personnel_first_name: expenditure.personnel_first_name || null,
+      personnel_last_name: expenditure.personnel_last_name || null,
+      personnel_rank: expenditure.personnel_rank || null
     }));
 
     res.json({
@@ -137,19 +136,19 @@ router.post('/', authenticate, authorize('admin', 'base_commander', 'logistics_o
     }
 
     // Check if there are sufficient assets available for expenditure
-    const asset = await prisma.assets.findFirst({
-      where: {
-        name: asset_name,
-        base_id: base_id
-      }
-    });
+    const assetResult = await query(
+      'SELECT * FROM assets WHERE name = $1 AND base_id = $2',
+      [asset_name, base_id]
+    );
 
-    if (!asset) {
+    if (assetResult.rows.length === 0) {
       return res.status(400).json({
         success: false,
         error: 'Base does not have this asset in inventory'
       });
     }
+
+    const asset = assetResult.rows[0];
 
     if (asset.available_quantity < quantity) {
       return res.status(400).json({
@@ -158,20 +157,18 @@ router.post('/', authenticate, authorize('admin', 'base_commander', 'logistics_o
       });
     }
 
-    // Use Prisma transaction
-    const result = await prisma.$transaction(async (tx) => {
+    // Use database transaction
+    await query('BEGIN');
+    
+    try {
       // Create expenditure record
-      const newExpenditure = await tx.expenditures.create({
-        data: {
-        asset_name,
-        base_id,
-        quantity,
-          expenditure_date: new Date(expenditure_date),
-        reason,
-          notes: notes || null,
-          created_by: req.user!.user_id
-        }
-      });
+      const newExpenditureResult = await query(`
+        INSERT INTO expenditures (asset_name, base_id, quantity, expenditure_date, reason, notes, created_by)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING *
+      `, [asset_name, base_id, quantity, new Date(expenditure_date), reason, notes || null, req.user!.user_id]);
+
+      const newExpenditure = newExpenditureResult.rows[0];
 
       // Update asset quantities - reduce from inventory
       const newQuantity = asset.quantity - quantity;
@@ -185,36 +182,39 @@ router.post('/', authenticate, authorize('admin', 'base_commander', 'logistics_o
         newStatus = 'low_stock';
       }
 
-      await tx.assets.update({
-        where: {
-          id: asset.id
-        },
-        data: {
-          quantity: newQuantity,
-          available_quantity: newAvailableQuantity,
-          status: newStatus
-        }
-      });
+      await query(`
+        UPDATE assets 
+        SET quantity = $1, available_quantity = $2, status = $3
+        WHERE id = $4
+      `, [newQuantity, newAvailableQuantity, newStatus, asset.id]);
 
-      return newExpenditure;
-    });
+      await query('COMMIT');
 
       // Log expenditure creation
       logger.info({
         action: 'EXPENDITURE_CREATED',
         user_id: req.user!.user_id,
-      expenditure_id: result.id,
-        asset_name,
-        base_id,
-        quantity,
-        reason,
-      remaining_quantity: asset.quantity - quantity
+        expenditure_id: newExpenditure.id,
+        asset_name: asset_name,
+        base_id: base_id,
+        quantity: quantity,
+        reason: reason
       });
 
-    return res.status(201).json({ success: true, data: result });
+      return res.status(201).json({
+        success: true,
+        data: newExpenditure
+      });
+    } catch (error) {
+      await query('ROLLBACK');
+      throw error;
+    }
   } catch (error) {
     logger.error('Create expenditure error:', error);
-    return res.status(500).json({ success: false, error: 'Server error' });
+    return res.status(500).json({
+      success: false,
+      error: 'Server error'
+    });
   }
 });
 
@@ -234,16 +234,19 @@ router.put('/:id', authenticate, authorize('admin', 'base_commander'), async (re
     }
 
     // Check if expenditure exists
-    const expenditure = await prisma.expenditures.findUnique({
-      where: { id }
-    });
+    const expenditureResult = await query(
+      'SELECT * FROM expenditures WHERE id = $1',
+      [id]
+    );
 
-    if (!expenditure) {
+    if (expenditureResult.rows.length === 0) {
       return res.status(404).json({
         success: false,
         error: 'Expenditure not found'
       });
     }
+
+    const expenditure = expenditureResult.rows[0];
 
     // Check access permissions
     if (req.user!.role === 'base_commander' && expenditure.base_id !== req.user!.base_id) {
@@ -266,19 +269,19 @@ router.put('/:id', authenticate, authorize('admin', 'base_commander'), async (re
       const quantityDifference = expenditure.quantity - quantity;
       
       // Get current asset inventory
-      const asset = await prisma.assets.findFirst({
-        where: {
-          name: expenditure.asset_name,
-          base_id: expenditure.base_id
-        }
-      });
+      const assetResult = await query(
+        'SELECT * FROM assets WHERE name = $1 AND base_id = $2',
+        [expenditure.asset_name, expenditure.base_id]
+      );
 
-      if (!asset) {
+      if (assetResult.rows.length === 0) {
         return res.status(400).json({
           success: false,
           error: 'Asset inventory not found'
         });
       }
+
+      const asset = assetResult.rows[0];
 
       const newQuantity = asset.quantity + quantityDifference;
       const newAvailableQuantity = asset.available_quantity + quantityDifference;
@@ -291,15 +294,11 @@ router.put('/:id', authenticate, authorize('admin', 'base_commander'), async (re
       }
 
       // Update asset quantities
-      await prisma.assets.update({
-        where: {
-          id: asset.id
-        },
-        data: {
-          quantity: newQuantity,
-          available_quantity: newAvailableQuantity
-        }
-      });
+      await query(`
+        UPDATE assets 
+        SET quantity = $1, available_quantity = $2
+        WHERE id = $3
+      `, [newQuantity, newAvailableQuantity, asset.id]);
     }
 
     // Update expenditure
@@ -309,10 +308,14 @@ router.put('/:id', authenticate, authorize('admin', 'base_commander'), async (re
     if (reason) updateData.reason = reason;
     if (notes !== undefined) updateData.notes = notes;
 
-    const updatedExpenditure = await prisma.expenditures.update({
-      where: { id },
-      data: updateData
-    });
+    const updatedExpenditureResult = await query(`
+      UPDATE expenditures
+      SET quantity = $1, expenditure_date = $2, reason = $3, notes = $4
+      WHERE id = $5
+      RETURNING *
+    `, [updateData.quantity, updateData.expenditure_date, updateData.reason, updateData.notes, id]);
+
+    const updatedExpenditure = updatedExpenditureResult.rows[0];
 
     // Log expenditure update
     logger.info({
@@ -348,28 +351,32 @@ router.delete('/:id', authenticate, authorize('admin'), async (req: Authenticate
     }
 
     // Check if expenditure exists
-    const expenditure = await prisma.expenditures.findUnique({
-      where: { id }
-    });
+    const expenditureResult = await query(
+      'SELECT * FROM expenditures WHERE id = $1',
+      [id]
+    );
 
-    if (!expenditure) {
+    if (expenditureResult.rows.length === 0) {
       return res.status(404).json({
         success: false,
         error: 'Expenditure not found'
       });
     }
 
-    // Use Prisma transaction
-    await prisma.$transaction(async (tx) => {
-      // Restore asset quantities
-      const asset = await tx.assets.findFirst({
-        where: {
-          name: expenditure.asset_name,
-          base_id: expenditure.base_id
-        }
-      });
+    const expenditure = expenditureResult.rows[0];
 
-      if (asset) {
+    // Use database transaction
+    await query('BEGIN');
+    
+    try {
+      // Restore asset quantities
+      const assetResult = await query(
+        'SELECT * FROM assets WHERE name = $1 AND base_id = $2',
+        [expenditure.asset_name, expenditure.base_id]
+      );
+
+      if (assetResult.rows.length > 0) {
+        const asset = assetResult.rows[0];
         const newQuantity = asset.quantity + expenditure.quantity;
         const newAvailableQuantity = asset.available_quantity + expenditure.quantity;
 
@@ -381,23 +388,20 @@ router.delete('/:id', authenticate, authorize('admin'), async (req: Authenticate
           newStatus = 'low_stock';
         }
 
-        await tx.assets.update({
-          where: {
-            id: asset.id
-          },
-          data: {
-            quantity: newQuantity,
-            available_quantity: newAvailableQuantity,
-            status: newStatus
-          }
-        });
+        await query(`
+          UPDATE assets 
+          SET quantity = $1, available_quantity = $2, status = $3
+          WHERE id = $4
+        `, [newQuantity, newAvailableQuantity, newStatus, asset.id]);
       }
 
       // Delete expenditure
-      await tx.expenditures.delete({
-        where: { id }
-      });
-    });
+      await query(`
+        DELETE FROM expenditures
+        WHERE id = $1
+      `, [id]);
+
+      await query('COMMIT');
 
       // Log expenditure deletion
       logger.info({
@@ -412,6 +416,10 @@ router.delete('/:id', authenticate, authorize('admin'), async (req: Authenticate
         success: true,
         message: 'Expenditure deleted successfully'
       });
+    } catch (error) {
+      await query('ROLLBACK');
+      throw error;
+    }
   } catch (error) {
     logger.error('Delete expenditure error:', error);
     return res.status(500).json({ success: false, error: 'Server error' });

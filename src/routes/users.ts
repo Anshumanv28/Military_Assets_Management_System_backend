@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { authenticate } from '../middleware/auth';
 import { logger } from '../utils/logger';
-import prisma from '../lib/prisma';
+import { query } from '../database/connection';
 
 const router = Router();
 
@@ -12,36 +12,30 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
   try {
     const { role, limit = '1000' } = req.query;
     
-    // Build where conditions for Prisma
-    const where: any = {
-      is_active: true
-    };
+    // Build where conditions
+    let whereClause = 'WHERE is_active = true';
+    const params: any[] = [];
 
     // Add role filter
     if (role && role !== '') {
-      where.role = role as string;
+      whereClause += ' AND role = $1';
+      params.push(role as string);
     }
 
-    const users = await prisma.users.findMany({
-      where,
-      select: {
-        id: true,
-        username: true,
-        first_name: true,
-        last_name: true,
-        role: true,
-        base_id: true
-      },
-      orderBy: [
-        { first_name: 'asc' },
-        { last_name: 'asc' }
-      ],
-      take: parseInt(limit as string)
-    });
+    const usersQuery = `
+      SELECT id, username, first_name, last_name, role, base_id
+      FROM users
+      ${whereClause}
+      ORDER BY first_name ASC, last_name ASC
+      LIMIT $${params.length + 1}
+    `;
+    params.push(parseInt(limit as string));
+
+    const usersResult = await query(usersQuery, params);
 
     return res.json({
       success: true,
-      data: users
+      data: usersResult.rows
     });
   } catch (error) {
     logger.error('Get users error:', error);

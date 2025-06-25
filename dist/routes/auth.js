@@ -152,7 +152,15 @@ router.get('/profile', auth_1.authenticate, async (req, res) => {
         const user = result.rows[0];
         res.json({
             success: true,
-            data: user
+            data: {
+                id: user.id,
+                email: user.email,
+                first_name: user.first_name,
+                last_name: user.last_name,
+                role: user.role,
+                base_id: user.base_id,
+                created_at: user.created_at
+            }
         });
     }
     catch (error) {

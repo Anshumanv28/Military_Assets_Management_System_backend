@@ -1,41 +1,31 @@
 "use strict";
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
 Object.defineProperty(exports, "__esModule", { value: true });
 const express_1 = require("express");
 const auth_1 = require("../middleware/auth");
 const logger_1 = require("../utils/logger");
-const prisma_1 = __importDefault(require("../lib/prisma"));
+const connection_1 = require("../database/connection");
 const router = (0, express_1.Router)();
 router.get('/', auth_1.authenticate, async (req, res) => {
     try {
         const { role, limit = '1000' } = req.query;
-        const where = {
-            is_active: true
-        };
+        let whereClause = 'WHERE is_active = true';
+        const params = [];
         if (role && role !== '') {
-            where.role = role;
+            whereClause += ' AND role = $1';
+            params.push(role);
         }
-        const users = await prisma_1.default.users.findMany({
-            where,
-            select: {
-                id: true,
-                username: true,
-                first_name: true,
-                last_name: true,
-                role: true,
-                base_id: true
-            },
-            orderBy: [
-                { first_name: 'asc' },
-                { last_name: 'asc' }
-            ],
-            take: parseInt(limit)
-        });
+        const usersQuery = `
+      SELECT id, username, first_name, last_name, role, base_id
+      FROM users
+      ${whereClause}
+      ORDER BY first_name ASC, last_name ASC
+      LIMIT $${params.length + 1}
+    `;
+        params.push(parseInt(limit));
+        const usersResult = await (0, connection_1.query)(usersQuery, params);
         return res.json({
             success: true,
-            data: users
+            data: usersResult.rows
         });
     }
     catch (error) {

@@ -15,22 +15,31 @@ const errorHandler_1 = require("./middleware/errorHandler");
 dotenv_1.default.config();
 const app = (0, express_1.default)();
 const PORT = process.env['PORT'] || 3001;
+app.set('trust proxy', 1);
 app.use((0, helmet_1.default)());
 const allowedOrigins = [
-    process.env['FRONTEND_URL'] || 'http://localhost:3000',
-    'https://your-frontend-name.vercel.app',
-    'https://military-assets-frontend.vercel.app'
+    'http://localhost:3000',
+    process.env['FRONTEND_URL'] || 'https://military-assets-management-system-f.vercel.app'
 ].filter(Boolean);
 app.use((0, cors_1.default)({
     origin: function (origin, callback) {
         if (!origin)
             return callback(null, true);
-        if (allowedOrigins.indexOf(origin) !== -1) {
-            callback(null, true);
+        if (origin === 'http://localhost:3000') {
+            return callback(null, true);
         }
-        else {
-            callback(new Error('Not allowed by CORS'));
+        if (allowedOrigins.includes(origin)) {
+            return callback(null, true);
         }
+        if (origin === 'https://military-assets-management-system-f.vercel.app') {
+            return callback(null, true);
+        }
+        const deploymentPattern = /^https:\/\/military-assets-management-system-frontend-[a-zA-Z0-9]{9}\.vercel\.app$/;
+        if (deploymentPattern.test(origin)) {
+            return callback(null, true);
+        }
+        console.log('CORS blocked origin:', origin);
+        callback(new Error('Not allowed by CORS'));
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -57,7 +66,8 @@ app.get('/health', (_req, res) => {
     res.json({
         status: 'OK',
         timestamp: new Date().toISOString(),
-        environment: process.env['NODE_ENV']
+        environment: process.env['NODE_ENV'],
+        version: 'v1'
     });
 });
 app.get('/api/health', (_req, res) => {
@@ -67,6 +77,26 @@ app.get('/api/health', (_req, res) => {
         environment: process.env['NODE_ENV'],
         version: process.env['API_VERSION'] || 'v1'
     });
+});
+app.get('/api/health/db', async (_req, res) => {
+    try {
+        await (0, connection_1.testConnection)();
+        res.json({
+            status: 'OK',
+            timestamp: new Date().toISOString(),
+            environment: process.env['NODE_ENV'],
+            database: 'connected'
+        });
+    }
+    catch (error) {
+        res.status(500).json({
+            status: 'ERROR',
+            timestamp: new Date().toISOString(),
+            environment: process.env['NODE_ENV'],
+            database: 'disconnected',
+            error: error instanceof Error ? error.message : 'Unknown error'
+        });
+    }
 });
 const auth_1 = __importDefault(require("./routes/auth"));
 const dashboard_1 = __importDefault(require("./routes/dashboard"));
@@ -88,6 +118,30 @@ app.use('/api/expenditures', expenditures_1.default);
 app.use('/api/bases', bases_1.default);
 app.use('/api/personnel', personnel_1.default);
 app.use('/api/users', users_1.default);
+app.get('/favicon.ico', (_req, res) => {
+    res.status(404).json({
+        success: false,
+        error: 'Favicon not found'
+    });
+});
+app.get('/favicon.png', (_req, res) => {
+    res.status(404).json({
+        success: false,
+        error: 'Favicon not found'
+    });
+});
+app.get('/', (_req, res) => {
+    res.json({
+        success: true,
+        message: 'Military Asset Management System API',
+        version: 'v1',
+        endpoints: {
+            health: '/api/health',
+            database: '/api/health/db',
+            docs: 'API documentation available at /api/* endpoints'
+        }
+    });
+});
 app.use('*', (_req, res) => {
     res.status(404).json({
         success: false,

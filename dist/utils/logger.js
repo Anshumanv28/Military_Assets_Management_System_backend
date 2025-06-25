@@ -10,14 +10,14 @@ const logger = winston_1.default.createLogger({
     format: winston_1.default.format.combine(winston_1.default.format.timestamp(), winston_1.default.format.errors({ stack: true }), winston_1.default.format.json()),
     defaultMeta: { service: 'military-assets-api' },
     transports: [
-        new winston_1.default.transports.File({ filename: 'logs/error.log', level: 'error' }),
-        new winston_1.default.transports.File({ filename: 'logs/combined.log' }),
+        new winston_1.default.transports.Console({
+            format: winston_1.default.format.combine(winston_1.default.format.colorize(), winston_1.default.format.simple())
+        })
     ],
 });
 exports.logger = logger;
-if (process.env['NODE_ENV'] !== 'production') {
-    logger.add(new winston_1.default.transports.Console({
-        format: winston_1.default.format.combine(winston_1.default.format.colorize(), winston_1.default.format.simple())
-    }));
+if (process.env['NODE_ENV'] === 'development' && !process.env['VERCEL']) {
+    logger.add(new winston_1.default.transports.File({ filename: 'logs/error.log', level: 'error' }));
+    logger.add(new winston_1.default.transports.File({ filename: 'logs/combined.log' }));
 }
 //# sourceMappingURL=logger.js.map

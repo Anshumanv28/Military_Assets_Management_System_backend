@@ -15,6 +15,7 @@ const sql = (0, postgres_1.default)(connectionString, {
     max_lifetime: 60 * 30,
     onnotice: () => { },
     onparameter: () => { },
+    prepare: false,
 });
 exports.default = sql;
 //# sourceMappingURL=db.js.map

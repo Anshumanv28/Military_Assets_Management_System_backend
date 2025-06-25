@@ -1,5 +1,5 @@
 import { Router, Response } from 'express';
-import prisma from '../lib/prisma';
+import { query } from '../database/connection';
 import { authenticate } from '../middleware/auth';
 import { logger } from '../utils/logger';
 import { AuthenticatedRequest } from '../types';
@@ -25,79 +25,93 @@ router.get('/summary', authenticate, async (req: AuthenticatedRequest, res: Resp
     }
     
     // Build where conditions for assets
-    const assetWhereConditions: any = {};
+    let assetWhereClause = 'WHERE 1=1';
+    const assetParams: any[] = [];
     if (targetBaseId) {
-      assetWhereConditions.base_id = targetBaseId;
+      assetWhereClause += ' AND base_id = $1';
+      assetParams.push(targetBaseId);
     }
     
     // Build where conditions for purchases
-    const purchaseWhereConditions: any = { status: 'approved' };
+    let purchaseWhereClause = 'WHERE status = $1';
+    const purchaseParams: any[] = ['approved'];
+    let purchaseParamIndex = 2;
     if (targetBaseId) {
-      purchaseWhereConditions.base_id = targetBaseId;
+      purchaseWhereClause += ` AND base_id = $${purchaseParamIndex}`;
+      purchaseParams.push(targetBaseId);
+      purchaseParamIndex++;
     }
     if (start_date && end_date) {
-      purchaseWhereConditions.purchase_date = {
-        gte: new Date(start_date),
-        lte: new Date(end_date)
-      };
+      purchaseWhereClause += ` AND purchase_date >= $${purchaseParamIndex} AND purchase_date <= $${purchaseParamIndex + 1}`;
+      purchaseParams.push(start_date, end_date);
     }
     
     // Build where conditions for expenditures
-    const expenditureWhereConditions: any = {};
+    let expenditureWhereClause = 'WHERE 1=1';
+    const expenditureParams: any[] = [];
+    let expenditureParamIndex = 1;
     if (targetBaseId) {
-      expenditureWhereConditions.base_id = targetBaseId;
+      expenditureWhereClause += ` AND base_id = $${expenditureParamIndex}`;
+      expenditureParams.push(targetBaseId);
+      expenditureParamIndex++;
     }
     if (start_date && end_date) {
-      expenditureWhereConditions.expenditure_date = {
-        gte: new Date(start_date),
-        lte: new Date(end_date)
-      };
+      expenditureWhereClause += ` AND expenditure_date >= $${expenditureParamIndex} AND expenditure_date <= $${expenditureParamIndex + 1}`;
+      expenditureParams.push(start_date, end_date);
     }
     
     // Build where conditions for transfers
-    const transferWhereConditions: any = { status: 'approved' };
+    let transferWhereClause = 'WHERE status = $1';
+    const transferParams: any[] = ['approved'];
+    let transferParamIndex = 2;
     if (start_date && end_date) {
-      transferWhereConditions.transfer_date = {
-        gte: new Date(start_date),
-        lte: new Date(end_date)
-      };
+      transferWhereClause += ` AND transfer_date >= $${transferParamIndex} AND transfer_date <= $${transferParamIndex + 1}`;
+      transferParams.push(start_date, end_date);
     }
 
     // Get total asset quantities
-    const totalQuantities = await prisma.assets.aggregate({
-      where: assetWhereConditions,
-      _sum: { quantity: true }
-    });
+    const totalQuantitiesResult = await query(
+      `SELECT COALESCE(SUM(quantity), 0) as total FROM assets ${assetWhereClause}`,
+      assetParams
+    );
+    const total_quantities = parseInt(totalQuantitiesResult.rows[0].total);
 
     // Get available asset quantities
-    const availableQuantities = await prisma.assets.aggregate({
-      where: assetWhereConditions,
-      _sum: { available_quantity: true }
-    });
+    const availableQuantitiesResult = await query(
+      `SELECT COALESCE(SUM(available_quantity), 0) as total FROM assets ${assetWhereClause}`,
+      assetParams
+    );
+    const available_quantities = parseInt(availableQuantitiesResult.rows[0].total);
 
     // Get assigned asset quantities
-    const assignedQuantities = await prisma.assets.aggregate({
-      where: assetWhereConditions,
-      _sum: { assigned_quantity: true }
-    });
+    const assignedQuantitiesResult = await query(
+      `SELECT COALESCE(SUM(assigned_quantity), 0) as total FROM assets ${assetWhereClause}`,
+      assetParams
+    );
+    const assigned_quantities = parseInt(assignedQuantitiesResult.rows[0].total);
 
     // Get low stock asset quantities
-    const lowStockQuantities = await prisma.assets.aggregate({
-      where: { ...assetWhereConditions, status: 'low_stock' },
-      _sum: { quantity: true }
-    });
+    const lowStockWhereClause = assetWhereClause + (assetParams.length > 0 ? ' AND status = $' + (assetParams.length + 1) : ' AND status = $1');
+    const lowStockParams = [...assetParams, 'low_stock'];
+    const lowStockQuantitiesResult = await query(
+      `SELECT COALESCE(SUM(quantity), 0) as total FROM assets ${lowStockWhereClause}`,
+      lowStockParams
+    );
+    const low_stock_quantities = parseInt(lowStockQuantitiesResult.rows[0].total);
 
     // Get assets purchased in date range (quantities)
-    const purchasedQuantities = await prisma.purchases.aggregate({
-      where: purchaseWhereConditions,
-      _sum: { quantity: true }
-    });
+    const purchasedQuantitiesResult = await query(
+      `SELECT COALESCE(SUM(quantity), 0) as total FROM purchases ${purchaseWhereClause}`,
+      purchaseParams
+    );
+    const purchased_quantities = parseInt(purchasedQuantitiesResult.rows[0].total);
 
     // Get assets expended in date range (quantities)
-    const expendedQuantities = await prisma.expenditures.aggregate({
-      where: expenditureWhereConditions,
-      _sum: { quantity: true }
-    });
+    const expendedQuantitiesResult = await query(
+      `SELECT COALESCE(SUM(quantity), 0) as total FROM expenditures ${expenditureWhereClause}`,
+      expenditureParams
+    );
+    const expended_quantities = parseInt(expendedQuantitiesResult.rows[0].total);
 
     // Get transfers based on role and base
     let transfersIn = 0;
@@ -105,35 +119,32 @@ router.get('/summary', authenticate, async (req: AuthenticatedRequest, res: Resp
 
     if (targetBaseId) {
       // Get transfers in (to this base)
-      const transfersInResult = await prisma.transfers.aggregate({
-        where: { ...transferWhereConditions, to_base_id: targetBaseId },
-        _sum: { quantity: true }
-      });
-      transfersIn = transfersInResult._sum.quantity || 0;
+      const transfersInWhereClause = transferWhereClause + ` AND to_base_id = $${transferParamIndex}`;
+      const transfersInParams = [...transferParams, targetBaseId];
+      const transfersInResult = await query(
+        `SELECT COALESCE(SUM(quantity), 0) as total FROM transfers ${transfersInWhereClause}`,
+        transfersInParams
+      );
+      transfersIn = parseInt(transfersInResult.rows[0].total);
 
       // Get transfers out (from this base)
-      const transfersOutResult = await prisma.transfers.aggregate({
-        where: { ...transferWhereConditions, from_base_id: targetBaseId },
-        _sum: { quantity: true }
-      });
-      transfersOut = transfersOutResult._sum.quantity || 0;
+      const transfersOutWhereClause = transferWhereClause + ` AND from_base_id = $${transferParamIndex}`;
+      const transfersOutParams = [...transferParams, targetBaseId];
+      const transfersOutResult = await query(
+        `SELECT COALESCE(SUM(quantity), 0) as total FROM transfers ${transfersOutWhereClause}`,
+        transfersOutParams
+      );
+      transfersOut = parseInt(transfersOutResult.rows[0].total);
     } else if (role === 'admin') {
       // For admin viewing all bases, show combined transfers
-      const adminTransfersResult = await prisma.transfers.aggregate({
-        where: transferWhereConditions,
-        _sum: { quantity: true }
-      });
-      const totalTransfers = adminTransfersResult._sum.quantity || 0;
+      const adminTransfersResult = await query(
+        `SELECT COALESCE(SUM(quantity), 0) as total FROM transfers ${transferWhereClause}`,
+        transferParams
+      );
+      const totalTransfers = parseInt(adminTransfersResult.rows[0].total);
       transfersIn = totalTransfers;
       transfersOut = totalTransfers;
     }
-
-    const total_quantities = totalQuantities._sum.quantity || 0;
-    const available_quantities = availableQuantities._sum.available_quantity || 0;
-    const assigned_quantities = assignedQuantities._sum.assigned_quantity || 0;
-    const low_stock_quantities = lowStockQuantities._sum.quantity || 0;
-    const purchased_quantities = purchasedQuantities._sum.quantity || 0;
-    const expended_quantities = expendedQuantities._sum.quantity || 0;
 
     // Calculate opening and closing balance for asset quantities
     const opening_balance = total_quantities - purchased_quantities - transfersIn + transfersOut + expended_quantities;
@@ -204,87 +215,82 @@ router.get('/movements', authenticate, async (req: AuthenticatedRequest, res: Re
     }
 
     // Get purchases breakdown
-    const purchases = await prisma.purchases.findMany({
-      where: purchaseWhereConditions,
-      include: {
-        assets: {
-          select: { name: true }
-        },
-        bases: {
-          select: { name: true }
-        }
-      },
-      orderBy: { purchase_date: 'desc' },
-      take: 10
-    });
+    const purchases = await query(
+      `SELECT id, quantity, purchase_date, assets.name, bases.name
+       FROM purchases
+       JOIN assets ON purchases.asset_id = assets.id
+       JOIN bases ON purchases.base_id = bases.id
+       WHERE ${targetBaseId ? `base_id = $1 AND ` : ''}status = $2
+       ORDER BY purchase_date DESC
+       LIMIT 10`,
+      targetBaseId ? [targetBaseId, 'approved'] : ['approved']
+    );
 
     // Get transfers breakdown
-    let transfers: any[] = [];
+    let transfers: any = { rows: [] };
     if (targetBaseId) {
-      transfers = await prisma.transfers.findMany({
-        where: {
-          ...transferWhereConditions,
-          OR: [
-            { from_base_id: targetBaseId },
-            { to_base_id: targetBaseId }
-          ]
-        },
-        include: {
-          bases_transfers_from_base_idTobases: {
-            select: { name: true }
-          },
-          bases_transfers_to_base_idTobases: {
-            select: { name: true }
-          }
-        },
-        orderBy: { transfer_date: 'desc' },
-        take: 10
-      });
+      transfers = await query(
+        `SELECT id, quantity, transfer_date, assets.name,
+                CASE
+                  WHEN from_base_id = $1 THEN bases_transfers_from_base_idTobases.name
+                  WHEN to_base_id = $1 THEN bases_transfers_to_base_idTobases.name
+                END AS from_base_name,
+                CASE
+                  WHEN to_base_id = $1 THEN bases_transfers_to_base_idTobases.name
+                END AS to_base_name
+         FROM transfers
+         JOIN bases_transfers_from_base_idTobases ON transfers.from_base_id = bases_transfers_from_base_idTobases.id
+         JOIN bases_transfers_to_base_idTobases ON transfers.to_base_id = bases_transfers_to_base_idTobases.id
+         WHERE ${targetBaseId ? `from_base_id = $1 OR to_base_id = $1 AND ` : ''}status = $2
+         ORDER BY transfer_date DESC
+         LIMIT 10`,
+        targetBaseId ? [targetBaseId, 'approved'] : ['approved']
+      );
     }
 
     // Transform purchases data
-    const purchasedAssets = purchases.map(purchase => ({
+    const purchasedAssets = purchases.rows.map((purchase: any) => ({
       id: purchase.id,
-      name: purchase.assets.name,
-      asset_name: purchase.assets.name,
+      name: purchase.name,
+      asset_name: purchase.name,
       quantity: purchase.quantity,
-      base_name: purchase.bases.name,
+      base_name: purchase.bases_name,
       date: purchase.purchase_date
     }));
 
-    // Separate transfers into incoming and outgoing based on target base
+    // Transform transfers data
     let transfersIn: any[] = [];
     let transfersOut: any[] = [];
-    
+
     if (targetBaseId) {
       // Get the base name for the target base
-      const targetBase = await prisma.bases.findUnique({
-        where: { id: targetBaseId },
-        select: { name: true }
-      });
-      
-      if (targetBase) {
-        transfersIn = transfers
-          .filter(t => t.bases_transfers_to_base_idTobases.name === targetBase.name)
-          .map(t => ({
+      const targetBase = await query(
+        `SELECT name FROM bases WHERE id = $1`,
+        [targetBaseId]
+      );
+       
+      if (targetBase.rows.length > 0) {
+        transfersIn = transfers.rows
+          .filter((t: any) => t.to_base_name === targetBase.rows[0].name)
+          .map((t: any) => ({
             id: t.id,
-            name: t.asset_name,
-            asset_name: t.asset_name,
+            name: t.name,
+            asset_name: t.name,
             quantity: t.quantity,
-            from_base_name: t.bases_transfers_from_base_idTobases.name,
-            to_base_name: t.bases_transfers_to_base_idTobases.name,
+            from_base_name: t.from_base_name,
+            to_base_name: t.to_base_name,
             date: t.transfer_date
           }));
-        
-        transfersOut = transfers
-          .filter(t => t.bases_transfers_from_base_idTobases.name === targetBase.name)
-          .map(t => ({
+         
+        transfersOut = transfers.rows
+          .filter((t: any) => t.from_base_name === targetBase.rows[0].name)
+          .map((t: any) => ({
             id: t.id,
-            name: t.asset_name,
-            asset_name: t.asset_name,
+            name: t.name,
+            asset_name: t.name,
             quantity: t.quantity,
-            from_base_name: t.bases_transfers_from_base_idTobases.name,
-            to_base_name: t.bases_transfers_to_base_idTobases.name,
+            from_base_name: t.from_base_name,
+            to_base_name: t.to_base_name,
             date: t.transfer_date
           }));
       }
@@ -330,27 +336,23 @@ router.get('/inventory', authenticate, async (req: AuthenticatedRequest, res: Re
       whereConditions.base_id = targetBaseId;
     }
 
-    const inventory = await prisma.assets.findMany({
-      where: whereConditions,
-      include: {
-        bases: {
-          select: { name: true }
-        }
-      },
-      orderBy: [
-        { name: 'asc' },
-        { bases: { name: 'asc' } }
-      ]
-    });
+    const inventory = await query(
+      `SELECT name, quantity, available_quantity, assigned_quantity, status, bases.name
+       FROM assets
+       JOIN bases ON assets.base_id = bases.id
+       WHERE ${targetBaseId ? `base_id = $1 AND ` : ''}name IS NOT NULL
+       ORDER BY name ASC, bases.name ASC`,
+      targetBaseId ? [targetBaseId] : []
+    );
 
     // Transform data to match expected format
-    const inventoryData = inventory.map(asset => ({
+    const inventoryData = inventory.rows.map((asset: any) => ({
       asset_name: asset.name,
       quantity: asset.quantity,
       available_quantity: asset.available_quantity,
       assigned_quantity: asset.assigned_quantity,
       status: asset.status,
-      base_name: asset.bases.name
+      base_name: asset.bases_name
     }));
 
     res.json({
@@ -396,24 +398,20 @@ router.get('/expended-assets', authenticate, async (req: AuthenticatedRequest, r
     }
 
     // Get expended assets by asset name
-    const expendedAssets = await prisma.expenditures.groupBy({
-      by: ['asset_name'],
-      where: whereConditions,
-      _sum: {
-        quantity: true
-      },
-      orderBy: {
-        _sum: {
-          quantity: 'desc'
-        }
-      },
-      take: 10
-    });
+    const expendedAssets = await query(
+      `SELECT asset_name, COALESCE(SUM(quantity), 0) as total
+       FROM expenditures
+       WHERE ${targetBaseId ? `base_id = $1 AND ` : ''}expenditure_date >= $2 AND expenditure_date <= $3
+       GROUP BY asset_name
+       ORDER BY total DESC
+       LIMIT 10`,
+      targetBaseId ? [targetBaseId, start_date, end_date] : [start_date, end_date]
+    );
 
     // Format data for chart
-    const chartData = expendedAssets.map(item => ({
+    const chartData = expendedAssets.rows.map((item: any) => ({
       name: item.asset_name,
-      value: item._sum.quantity || 0
+      value: parseInt(item.total)
     }));
 
     res.json({
