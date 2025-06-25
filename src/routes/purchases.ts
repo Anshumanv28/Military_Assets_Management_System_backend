@@ -188,42 +188,32 @@ router.put('/:id/approve', authenticate, authorize('admin'), async (req: Authent
       });
     }
 
-    // Use database transaction
-    await query('BEGIN');
-    
-    try {
-      // Update purchase status
-      const updatedPurchaseResult = await query(`
-        UPDATE purchases 
-        SET status = $1, approved_by = $2, approved_at = $3
-        WHERE id = $4
-        RETURNING *
-      `, ['approved', req.user!.user_id, new Date(), id]);
+    // Update purchase status without transaction for now
+    const updatedPurchaseResult = await query(`
+      UPDATE purchases 
+      SET status = $1, approved_by = $2, approved_at = $3
+      WHERE id = $4
+      RETURNING *
+    `, ['approved', req.user!.user_id, new Date(), id]);
 
-      const updatedPurchase = updatedPurchaseResult.rows[0];
+    const updatedPurchase = updatedPurchaseResult.rows[0];
 
-      // Add assets to inventory
-      await addAssetsToInventory(updatedPurchase);
+    // Add assets to inventory
+    await addAssetsToInventory(updatedPurchase);
 
-      await query('COMMIT');
+    // Log purchase approval
+    logger.info({
+      action: 'PURCHASE_APPROVED',
+      user_id: req.user!.user_id,
+      purchase_id: id,
+      asset_id: purchase.asset_id,
+      quantity: purchase.quantity
+    });
 
-      // Log purchase approval
-      logger.info({
-        action: 'PURCHASE_APPROVED',
-        user_id: req.user!.user_id,
-        purchase_id: id,
-        asset_id: purchase.asset_id,
-        quantity: purchase.quantity
-      });
-
-      return res.json({
-        success: true,
-        data: updatedPurchase
-      });
-    } catch (error) {
-      await query('ROLLBACK');
-      throw error;
-    }
+    return res.json({
+      success: true,
+      data: updatedPurchase
+    });
   } catch (error) {
     logger.error('Approve purchase error:', error);
     return res.status(500).json({

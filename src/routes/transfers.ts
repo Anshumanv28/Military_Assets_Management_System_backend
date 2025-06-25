@@ -210,44 +210,33 @@ router.put('/:id/approve', authenticate, authorize('admin'), async (req: Authent
     
     if (sourceAsset.available_quantity < transfer.quantity) return res.status(400).json({ success: false, error: `Insufficient available quantity. Available: ${sourceAsset.available_quantity}, Requested: ${transfer.quantity}` });
     
-    // Use database transaction
-    console.log('Starting transaction');
-    await query('BEGIN');
-    
-    try {
-      // Approve transfer
-      const approvedTransferResult = await query(`
-        UPDATE transfers 
-        SET status = $1, approved_by = $2, approved_at = $3
-        WHERE id = $4
-        RETURNING *
-      `, ['approved', req.user!.user_id, new Date(), id]);
+    // Approve transfer without transaction for now
+    const approvedTransferResult = await query(`
+      UPDATE transfers 
+      SET status = $1, approved_by = $2, approved_at = $3
+      WHERE id = $4
+      RETURNING *
+    `, ['approved', req.user!.user_id, new Date(), id]);
 
-      const approvedTransfer = approvedTransferResult.rows[0];
-      console.log('Transfer approved:', approvedTransfer);
-      
-      // Execute the transfer
-      console.log('Executing transfer...');
-      await executeTransfer(approvedTransfer);
-      
-      console.log('Committing transaction');
-      await query('COMMIT');
-      
-      logger.info({ 
-        action: 'TRANSFER_APPROVED', 
-        user_id: req.user!.user_id, 
-        transfer_id: id, 
-        transfer_number: transfer.transfer_number, 
-        asset_name: transfer.asset_name, 
-        quantity: transfer.quantity 
-      });
-      
-      return res.json({ success: true, data: approvedTransfer });
-    } catch (error) {
-      console.error('Error in transaction, rolling back:', error);
-      await query('ROLLBACK');
-      throw error;
-    }
+    const approvedTransfer = approvedTransferResult.rows[0];
+    console.log('Transfer approved:', approvedTransfer);
+    
+    // Execute the transfer
+    console.log('Executing transfer...');
+    await executeTransfer(approvedTransfer);
+    
+    console.log('Transfer executed successfully');
+    
+    logger.info({ 
+      action: 'TRANSFER_APPROVED', 
+      user_id: req.user!.user_id, 
+      transfer_id: id, 
+      transfer_number: transfer.transfer_number, 
+      asset_name: transfer.asset_name, 
+      quantity: transfer.quantity 
+    });
+    
+    return res.json({ success: true, data: approvedTransfer });
   } catch (error) {
     console.error('Approve transfer error:', error);
     logger.error('Approve transfer error:', error);
