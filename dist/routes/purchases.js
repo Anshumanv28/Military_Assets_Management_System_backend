@@ -371,7 +371,12 @@ router.delete('/:id', auth_1.authenticate, (0, auth_1.authorize)('admin', 'base_
     }
 });
 async function addAssetsToInventory(purchase) {
-    const existingAssetResult = await (0, connection_1.query)('SELECT * FROM assets WHERE id = $1 AND base_id = $2', [purchase.asset_id, purchase.base_id]);
+    const assetResult = await (0, connection_1.query)('SELECT name FROM assets WHERE id = $1', [purchase.asset_id]);
+    if (assetResult.rows.length === 0) {
+        throw new Error(`Asset with id ${purchase.asset_id} not found`);
+    }
+    const assetName = assetResult.rows[0].name;
+    const existingAssetResult = await (0, connection_1.query)('SELECT * FROM assets WHERE name = $1 AND base_id = $2', [assetName, purchase.base_id]);
     if (existingAssetResult.rows.length > 0) {
         const existingAsset = existingAssetResult.rows[0];
         const newQuantity = existingAsset.quantity + purchase.quantity;
@@ -388,9 +393,9 @@ async function addAssetsToInventory(purchase) {
     }
     else {
         await (0, connection_1.query)(`
-      INSERT INTO assets (id, base_id, quantity, available_quantity, assigned_quantity, status)
+      INSERT INTO assets (name, base_id, quantity, available_quantity, assigned_quantity, status)
       VALUES ($1, $2, $3, $3, 0, 'available')
-    `, [purchase.asset_id, purchase.base_id, purchase.quantity]);
+    `, [assetName, purchase.base_id, purchase.quantity]);
     }
 }
 exports.default = router;

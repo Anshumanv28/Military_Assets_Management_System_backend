@@ -478,10 +478,22 @@ router.delete('/:id', authenticate, authorize('admin', 'base_commander'), async 
 
 // Helper function to add assets to inventory
 async function addAssetsToInventory(purchase: { id: string; asset_id: string; base_id: string; quantity: number }) {
-  // Check if asset already exists in inventory
+  // First, get the asset name from the assets table using the asset_id
+  const assetResult = await query(
+    'SELECT name FROM assets WHERE id = $1',
+    [purchase.asset_id]
+  );
+
+  if (assetResult.rows.length === 0) {
+    throw new Error(`Asset with id ${purchase.asset_id} not found`);
+  }
+
+  const assetName = assetResult.rows[0].name;
+
+  // Check if asset already exists in inventory for this base
   const existingAssetResult = await query(
-    'SELECT * FROM assets WHERE id = $1 AND base_id = $2',
-    [purchase.asset_id, purchase.base_id]
+    'SELECT * FROM assets WHERE name = $1 AND base_id = $2',
+    [assetName, purchase.base_id]
   );
 
   if (existingAssetResult.rows.length > 0) {
@@ -504,9 +516,9 @@ async function addAssetsToInventory(purchase: { id: string; asset_id: string; ba
   } else {
     // Create new asset entry
     await query(`
-      INSERT INTO assets (id, base_id, quantity, available_quantity, assigned_quantity, status)
+      INSERT INTO assets (name, base_id, quantity, available_quantity, assigned_quantity, status)
       VALUES ($1, $2, $3, $3, 0, 'available')
-    `, [purchase.asset_id, purchase.base_id, purchase.quantity]);
+    `, [assetName, purchase.base_id, purchase.quantity]);
   }
 }
 
