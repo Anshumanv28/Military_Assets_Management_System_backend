@@ -1,6 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
-import prisma from '../lib/prisma';
+import { query } from '../database/connection';
 import { logger } from '../utils/logger';
 
 // Extend Express Request interface to include user
@@ -33,18 +33,13 @@ export const authenticate = async (req: Request, res: Response, next: NextFuncti
     const token = authHeader.substring(7);
     const decoded = jwt.verify(token, process.env['JWT_SECRET']!) as { user_id: string };
     
-    // Get user details from database using Prisma
-    const user = await prisma.users.findUnique({
-      where: { id: decoded.user_id },
-      select: {
-        id: true,
-        email: true,
-        role: true,
-        base_id: true
-      }
-    });
+    // Get user details from database
+    const userResult = await query(
+      'SELECT id, email, role, base_id FROM users WHERE id = $1',
+      [decoded.user_id]
+    );
 
-    if (!user) {
+    if (userResult.rows.length === 0) {
       res.status(401).json({
         success: false,
         error: 'Invalid token'
@@ -52,11 +47,12 @@ export const authenticate = async (req: Request, res: Response, next: NextFuncti
       return;
     }
 
+    const user = userResult.rows[0];
     req.user = {
       user_id: user.id,
       email: user.email,
       role: user.role,
-      ...(user.base_id && { base_id: user.base_id })
+      base_id: user.base_id
     };
 
     next();
@@ -105,23 +101,19 @@ export const optionalAuth = async (req: Request, _res: Response, next: NextFunct
     const token = authHeader.substring(7);
     const decoded = jwt.verify(token, process.env['JWT_SECRET']!) as { user_id: string };
     
-    // Get user details from database using Prisma
-    const user = await prisma.users.findUnique({
-      where: { id: decoded.user_id },
-      select: {
-        id: true,
-        email: true,
-        role: true,
-        base_id: true
-      }
-    });
+    // Get user details from database
+    const userResult = await query(
+      'SELECT id, email, role, base_id FROM users WHERE id = $1',
+      [decoded.user_id]
+    );
 
-    if (user) {
+    if (userResult.rows.length > 0) {
+      const user = userResult.rows[0];
       req.user = {
         user_id: user.id,
         email: user.email,
         role: user.role,
-        ...(user.base_id && { base_id: user.base_id })
+        base_id: user.base_id
       };
     }
 
