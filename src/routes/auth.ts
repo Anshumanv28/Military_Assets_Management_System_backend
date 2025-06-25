@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import { body, validationResult } from 'express-validator';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import { query } from '../database/connection';
+import prisma from '../lib/prisma';
 import { authenticate } from '../middleware/auth';
 import { logger } from '../utils/logger';
 
@@ -33,12 +33,11 @@ router.post('/register', [
     const { email, password, first_name, last_name, role, base_id } = req.body;
 
     // Check if user already exists
-    const existingUser = await query(
-      'SELECT id FROM users WHERE email = $1',
-      [email]
-    );
+    const existingUser = await prisma.users.findUnique({
+      where: { email }
+    });
 
-    if (existingUser.rows.length > 0) {
+    if (existingUser) {
       res.status(400).json({
         success: false,
         error: 'User already exists'
@@ -51,12 +50,24 @@ router.post('/register', [
     const hashedPassword = await bcrypt.hash(password, saltRounds);
 
     // Create user
-    const result = await query(
-      'INSERT INTO users (email, password_hash, first_name, last_name, role, base_id) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, email, first_name, last_name, role, base_id',
-      [email, hashedPassword, first_name, last_name, role, base_id || null]
-    );
-
-    const user = result.rows[0];
+    const user = await prisma.users.create({
+      data: {
+        email,
+        password_hash: hashedPassword,
+        first_name,
+        last_name,
+        role,
+        ...(base_id && { base_id })
+      },
+      select: {
+        id: true,
+        email: true,
+        first_name: true,
+        last_name: true,
+        role: true,
+        base_id: true
+      }
+    });
 
     // Generate JWT token
     const token = jwt.sign(
@@ -81,14 +92,7 @@ router.post('/register', [
     res.status(201).json({
       success: true,
       data: {
-        user: {
-          id: user.id,
-          email: user.email,
-          first_name: user.first_name,
-          last_name: user.last_name,
-          role: user.role,
-          base_id: user.base_id
-        },
+        user,
         token,
         refreshToken
       }
@@ -125,12 +129,20 @@ router.post('/login', [
     const { email, password } = req.body;
 
     // Find user
-    const result = await query(
-      'SELECT id, email, password_hash, first_name, last_name, role, base_id FROM users WHERE email = $1',
-      [email]
-    );
+    const user = await prisma.users.findUnique({
+      where: { email },
+      select: {
+        id: true,
+        email: true,
+        password_hash: true,
+        first_name: true,
+        last_name: true,
+        role: true,
+        base_id: true
+      }
+    });
 
-    if (result.rows.length === 0) {
+    if (!user) {
       logger.warn('Login attempt failed for non-existent user', { email, ip: req.ip });
       res.status(401).json({
         success: false,
@@ -138,8 +150,6 @@ router.post('/login', [
       });
       return;
     }
-
-    const user = result.rows[0];
 
     // Check password
     const isPasswordValid = await bcrypt.compare(password, user.password_hash);
@@ -171,17 +181,13 @@ router.post('/login', [
       email: user.email
     });
 
+    // Remove password_hash from response
+    const { password_hash, ...userWithoutPassword } = user;
+
     res.json({
       success: true,
       data: {
-        user: {
-          id: user.id,
-          email: user.email,
-          first_name: user.first_name,
-          last_name: user.last_name,
-          role: user.role,
-          base_id: user.base_id
-        },
+        user: userWithoutPassword,
         token,
         refreshToken
       }
@@ -200,12 +206,20 @@ router.post('/login', [
 // @access  Private
 router.get('/profile', authenticate, async (req: Request, res: Response): Promise<void> => {
   try {
-    const result = await query(
-      'SELECT id, email, first_name, last_name, role, base_id, created_at FROM users WHERE id = $1',
-      [req.user!.user_id]
-    );
+    const result = await prisma.users.findUnique({
+      where: { id: req.user!.user_id },
+      select: {
+        id: true,
+        email: true,
+        first_name: true,
+        last_name: true,
+        role: true,
+        base_id: true,
+        created_at: true
+      }
+    });
 
-    if (result.rows.length === 0) {
+    if (!result) {
       res.status(404).json({
         success: false,
         error: 'User not found'
@@ -213,11 +227,9 @@ router.get('/profile', authenticate, async (req: Request, res: Response): Promis
       return;
     }
 
-    const user = result.rows[0];
-
     res.json({
       success: true,
-      data: user
+      data: result
     });
   } catch (error) {
     logger.error('Get profile error:', error);
@@ -251,12 +263,19 @@ router.post('/refresh', [
     const decoded = jwt.verify(refreshToken, process.env['JWT_SECRET']!) as { user_id: string };
 
     // Check if user exists
-    const result = await query(
-      'SELECT id, email, first_name, last_name, role, base_id FROM users WHERE id = $1',
-      [decoded.user_id]
-    );
+    const result = await prisma.users.findUnique({
+      where: { id: decoded.user_id },
+      select: {
+        id: true,
+        email: true,
+        first_name: true,
+        last_name: true,
+        role: true,
+        base_id: true
+      }
+    });
 
-    if (result.rows.length === 0) {
+    if (!result) {
       res.status(401).json({
         success: false,
         error: 'Invalid refresh token'
@@ -264,7 +283,7 @@ router.post('/refresh', [
       return;
     }
 
-    const user = result.rows[0];
+    const user = result;
 
     // Generate new access token
     const newToken = jwt.sign(
@@ -276,14 +295,7 @@ router.post('/refresh', [
       success: true,
       data: {
         token: newToken,
-        user: {
-          id: user.id,
-          email: user.email,
-          first_name: user.first_name,
-          last_name: user.last_name,
-          role: user.role,
-          base_id: user.base_id
-        }
+        user
       }
     });
   } catch (error) {
