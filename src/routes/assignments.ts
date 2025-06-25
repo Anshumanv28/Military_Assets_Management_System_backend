@@ -100,6 +100,7 @@ router.post('/', authenticate, authorize('admin', 'base_commander', 'logistics_o
 
     // Validate required fields
     if (!asset_name || !assigned_to || !base_id || !quantity || !assignment_date) {
+      console.log('Missing required fields:', { asset_name, assigned_to, base_id, quantity, assignment_date });
       return res.status(400).json({
         success: false,
         error: 'Missing required fields'
@@ -111,6 +112,7 @@ router.post('/', authenticate, authorize('admin', 'base_commander', 'logistics_o
     console.log('Quantity type:', typeof validQuantity, 'Value:', validQuantity);
     
     if (isNaN(validQuantity) || validQuantity <= 0) {
+      console.log('Invalid quantity:', validQuantity);
       return res.status(400).json({
         success: false,
         error: 'Quantity must be a positive number'
@@ -119,19 +121,24 @@ router.post('/', authenticate, authorize('admin', 'base_commander', 'logistics_o
 
     // Check access permissions
     if (req.user!.role === 'base_commander' && base_id !== req.user!.base_id) {
+      console.log('Access denied for base commander');
       return res.status(403).json({
         success: false,
         error: 'Base commanders can only create assignments for their base'
       });
     }
 
+    console.log('Checking if asset exists...');
     // Check if asset exists and has sufficient quantity
     const assetResult = await query(
       'SELECT quantity, available_quantity, assigned_quantity FROM assets WHERE name = $1 AND base_id = $2',
       [asset_name, base_id]
     );
 
+    console.log('Asset query result:', assetResult);
+
     if (assetResult.rows.length === 0) {
+      console.log('Asset not found:', { asset_name, base_id });
       return res.status(404).json({
         success: false,
         error: 'Asset not found'
@@ -144,29 +151,36 @@ router.post('/', authenticate, authorize('admin', 'base_commander', 'logistics_o
     console.log('Assigned quantity:', asset.assigned_quantity, 'Type:', typeof asset.assigned_quantity);
 
     if (asset.available_quantity < validQuantity) {
+      console.log('Insufficient available quantity:', { available: asset.available_quantity, requested: validQuantity });
       return res.status(400).json({
         success: false,
         error: 'Insufficient available quantity'
       });
     }
 
+    console.log('Checking if personnel exists...');
     // Check if personnel exists
     const personnelResult = await query(
       'SELECT * FROM personnel WHERE id = $1',
       [assigned_to]
     );
 
+    console.log('Personnel query result:', personnelResult);
+
     if (personnelResult.rows.length === 0) {
+      console.log('Personnel not found:', assigned_to);
       return res.status(404).json({
         success: false,
         error: 'Personnel not found'
       });
     }
 
+    console.log('Starting transaction...');
     // Use database transaction
     await query('BEGIN');
     
     try {
+      console.log('Creating assignment...');
       // Create assignment
       const createQuery = `
         INSERT INTO assignments (asset_name, assigned_to, assigned_by, base_id, quantity, assignment_date, notes)
@@ -184,6 +198,7 @@ router.post('/', authenticate, authorize('admin', 'base_commander', 'logistics_o
       ]);
 
       const newAssignment = result.rows[0];
+      console.log('Assignment created:', newAssignment);
 
       // Update asset quantities - ensure we use valid numbers
       const availableQuantity = parseInt(asset.available_quantity) || 0;
@@ -195,12 +210,14 @@ router.post('/', authenticate, authorize('admin', 'base_commander', 'logistics_o
       console.log('Original available:', availableQuantity, 'Original assigned:', assignedQuantity);
       console.log('New available:', newAvailableQuantity, 'New assigned:', newAssignedQuantity);
 
+      console.log('Updating asset quantities...');
       await query(`
         UPDATE assets 
         SET available_quantity = $1, assigned_quantity = $2
         WHERE name = $3 AND base_id = $4
       `, [newAvailableQuantity, newAssignedQuantity, asset_name, base_id]);
 
+      console.log('Committing transaction...');
       await query('COMMIT');
 
       // Log assignment creation
@@ -213,15 +230,18 @@ router.post('/', authenticate, authorize('admin', 'base_commander', 'logistics_o
         quantity: validQuantity
       });
 
+      console.log('Assignment created successfully');
       return res.status(201).json({
         success: true,
         data: newAssignment
       });
     } catch (error) {
+      console.error('Error in transaction, rolling back:', error);
       await query('ROLLBACK');
       throw error;
     }
   } catch (error) {
+    console.error('Create assignment error:', error);
     logger.error('Create assignment error:', error);
     return res.status(500).json({
       success: false,
