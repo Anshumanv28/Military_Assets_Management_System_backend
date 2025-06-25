@@ -23,8 +23,8 @@ app.use(helmet());
 // CORS configuration
 const allowedOrigins = [
   'http://localhost:3000',
-  'https://military-asset-management-system-7vex3fwvi.vercel.app'
-];
+  process.env['FRONTEND_URL'] || 'https://military-asset-management-system-7vex3fwvi.vercel.app'
+].filter(Boolean);
 
 app.use(cors({
   origin: function (origin, callback) {
