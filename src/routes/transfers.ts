@@ -186,10 +186,14 @@ router.put('/:id/approve', authenticate, authorize('admin'), async (req: Authent
     const { id } = req.params;
     if (!id) return res.status(400).json({ success: false, error: 'Transfer ID is required' });
     
+    console.log('Approving transfer with ID:', id);
+    
     const transferResult = await query('SELECT * FROM transfers WHERE id = $1', [id]);
     if (transferResult.rows.length === 0) return res.status(404).json({ success: false, error: 'Transfer not found' });
     
     const transfer = transferResult.rows[0];
+    console.log('Transfer found:', transfer);
+    
     if (transfer.status === 'approved') return res.status(400).json({ success: false, error: 'Transfer is already approved' });
     if (transfer.status === 'rejected') return res.status(400).json({ success: false, error: 'Cannot approve a rejected transfer' });
     
@@ -202,9 +206,12 @@ router.put('/:id/approve', authenticate, authorize('admin'), async (req: Authent
     if (sourceAssetResult.rows.length === 0) return res.status(400).json({ success: false, error: 'Source base no longer has this asset in inventory' });
     
     const sourceAsset = sourceAssetResult.rows[0];
+    console.log('Source asset for validation:', sourceAsset);
+    
     if (sourceAsset.available_quantity < transfer.quantity) return res.status(400).json({ success: false, error: `Insufficient available quantity. Available: ${sourceAsset.available_quantity}, Requested: ${transfer.quantity}` });
     
     // Use database transaction
+    console.log('Starting transaction');
     await query('BEGIN');
     
     try {
@@ -217,10 +224,13 @@ router.put('/:id/approve', authenticate, authorize('admin'), async (req: Authent
       `, ['approved', req.user!.user_id, new Date(), id]);
 
       const approvedTransfer = approvedTransferResult.rows[0];
+      console.log('Transfer approved:', approvedTransfer);
       
       // Execute the transfer
+      console.log('Executing transfer...');
       await executeTransfer(approvedTransfer);
       
+      console.log('Committing transaction');
       await query('COMMIT');
       
       logger.info({ 
@@ -234,10 +244,12 @@ router.put('/:id/approve', authenticate, authorize('admin'), async (req: Authent
       
       return res.json({ success: true, data: approvedTransfer });
     } catch (error) {
+      console.error('Error in transaction, rolling back:', error);
       await query('ROLLBACK');
       throw error;
     }
   } catch (error) {
+    console.error('Approve transfer error:', error);
     logger.error('Approve transfer error:', error);
     return res.status(500).json({ success: false, error: 'Server error' });
   }
@@ -324,6 +336,8 @@ router.delete('/:id', authenticate, authorize('admin', 'base_commander'), async 
 // Helper function to execute transfer
 async function executeTransfer(transfer: { id: string; from_base_id: string; to_base_id: string; asset_name: string; quantity: number; transfer_number: string; }) {
   try {
+    console.log('Executing transfer:', transfer);
+    
     // Reduce quantity from source base
     const sourceAssetResult = await query(
       'SELECT * FROM assets WHERE name = $1 AND base_id = $2',
@@ -335,8 +349,18 @@ async function executeTransfer(transfer: { id: string; from_base_id: string; to_
     }
     
     const sourceAsset = sourceAssetResult.rows[0];
+    console.log('Source asset:', sourceAsset);
+    
     const newSourceQuantity = sourceAsset.quantity - transfer.quantity;
     const newSourceAvailableQuantity = sourceAsset.available_quantity - transfer.quantity;
+    
+    console.log('Source asset calculations:', {
+      currentQuantity: sourceAsset.quantity,
+      currentAvailable: sourceAsset.available_quantity,
+      transferQuantity: transfer.quantity,
+      newQuantity: newSourceQuantity,
+      newAvailable: newSourceAvailableQuantity
+    });
     
     // Update source asset status
     let newSourceStatus = 'available';
@@ -352,6 +376,8 @@ async function executeTransfer(transfer: { id: string; from_base_id: string; to_
       WHERE id = $4
     `, [newSourceQuantity, newSourceAvailableQuantity, newSourceStatus, sourceAsset.id]);
     
+    console.log('Source asset updated successfully');
+    
     // Add quantity to destination base
     const destAssetResult = await query(
       'SELECT * FROM assets WHERE name = $1 AND base_id = $2',
@@ -361,6 +387,8 @@ async function executeTransfer(transfer: { id: string; from_base_id: string; to_
     if (destAssetResult.rows.length > 0) {
       // Update existing asset
       const destAsset = destAssetResult.rows[0];
+      console.log('Destination asset (existing):', destAsset);
+      
       const newDestQuantity = destAsset.quantity + transfer.quantity;
       const newDestAvailableQuantity = destAsset.available_quantity + transfer.quantity;
       
@@ -375,12 +403,18 @@ async function executeTransfer(transfer: { id: string; from_base_id: string; to_
         SET quantity = $1, available_quantity = $2, status = $3
         WHERE id = $4
       `, [newDestQuantity, newDestAvailableQuantity, newDestStatus, destAsset.id]);
+      
+      console.log('Destination asset updated successfully');
     } else {
       // Create new asset entry
+      console.log('Creating new destination asset');
+      
       await query(`
         INSERT INTO assets (name, base_id, quantity, available_quantity, assigned_quantity, status)
         VALUES ($1, $2, $3, $3, 0, 'available')
       `, [transfer.asset_name, transfer.to_base_id, transfer.quantity]);
+      
+      console.log('New destination asset created successfully');
     }
     
     logger.info({
@@ -393,6 +427,7 @@ async function executeTransfer(transfer: { id: string; from_base_id: string; to_
       to_base_id: transfer.to_base_id
     });
   } catch (error) {
+    console.error('Error in executeTransfer:', error);
     logger.error('Error executing transfer:', error);
     throw error;
   }
