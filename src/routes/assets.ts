@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { authenticate, authorize } from '../middleware/auth';
 import { logger } from '../utils/logger';
-import prisma from '../lib/prisma';
+import { query } from '../database/connection';
 
 const router = Router();
 
@@ -12,55 +12,62 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
   try {
     const { base_id, name, status, page = 1, limit = 10 } = req.query;
     
-    // Build where conditions for Prisma
-    const where: any = {};
+    // Build where conditions
+    let whereClause = 'WHERE 1=1';
+    const params: any[] = [];
+    let paramIndex = 1;
 
     // Apply filters based on user role
     if (req.user!.role === 'base_commander' && req.user!.base_id) {
-      where.base_id = req.user!.base_id;
+      whereClause += ` AND a.base_id = $${paramIndex}`;
+      params.push(req.user!.base_id);
+      paramIndex++;
     } else if (base_id && req.user!.role !== 'admin') {
-      where.base_id = base_id as string;
+      whereClause += ` AND a.base_id = $${paramIndex}`;
+      params.push(base_id);
+      paramIndex++;
     }
 
     if (name) {
-      where.name = {
-        contains: name as string,
-        mode: 'insensitive'
-      };
+      whereClause += ` AND a.name ILIKE $${paramIndex}`;
+      params.push(`%${name}%`);
+      paramIndex++;
     }
 
     if (status) {
-      where.status = status as string;
+      whereClause += ` AND a.status = $${paramIndex}`;
+      params.push(status);
+      paramIndex++;
     }
 
     // Get total count
-    const total = await prisma.assets.count({ where });
+    const countQuery = `SELECT COUNT(*) FROM assets a ${whereClause}`;
+    const countResult = await query(countQuery, params);
+    const total = parseInt(countResult.rows[0].count);
 
     // Get paginated results with base information
     const offset = (parseInt(page as string) - 1) * parseInt(limit as string);
-    const assets = await prisma.assets.findMany({
-      where,
-      include: {
-        bases: {
-          select: {
-            name: true,
-            code: true
-          }
-        }
-      },
-      orderBy: [
-        { name: 'asc' },
-        { bases: { name: 'asc' } }
-      ],
-      take: parseInt(limit as string),
-      skip: offset
-    });
+    const assetsQuery = `
+      SELECT 
+        a.*,
+        b.name as base_name,
+        b.code as base_code
+      FROM assets a
+      LEFT JOIN bases b ON a.base_id = b.id
+      ${whereClause}
+      ORDER BY a.name ASC, b.name ASC
+      LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
+    `;
+    params.push(parseInt(limit as string), offset);
+    
+    const assetsResult = await query(assetsQuery, params);
+    const assets = assetsResult.rows;
 
     // Transform data to match expected format
-    const transformedAssets = assets.map(asset => ({
+    const transformedAssets = assets.map((asset: any) => ({
       ...asset,
-      current_base_name: asset.bases.name,
-      base_code: asset.bases.code
+      current_base_name: asset.base_name,
+      base_code: asset.base_code
     }));
 
     res.json({
