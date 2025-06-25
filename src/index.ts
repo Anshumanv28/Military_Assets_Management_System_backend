@@ -23,7 +23,7 @@ app.use(helmet());
 // CORS configuration
 const allowedOrigins = [
   'http://localhost:3000',
-  process.env['FRONTEND_URL'] || 'military-assets-management-system-frontend-36k3f694p.vercel.app'
+  process.env['FRONTEND_URL'] || 'https://military-assets-management-system-f.vercel.app'
 ].filter(Boolean);
 
 app.use(cors({
@@ -31,12 +31,29 @@ app.use(cors({
     // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) return callback(null, true);
     
-    if (allowedOrigins.indexOf(origin) !== -1) {
-      callback(null, true);
-    } else {
-      console.log('CORS blocked origin:', origin);
-      callback(new Error('Not allowed by CORS'));
+    // Allow localhost for development
+    if (origin === 'http://localhost:3000') {
+      return callback(null, true);
     }
+    
+    // Allow specific frontend URL from environment variable
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    
+    // Allow main frontend URL
+    if (origin === 'https://military-assets-management-system-f.vercel.app') {
+      return callback(null, true);
+    }
+    
+    // Allow deployment URLs with 9-character alphanumeric middle part
+    const deploymentPattern = /^https:\/\/military-assets-management-system-frontend-[a-zA-Z0-9]{9}\.vercel\.app$/;
+    if (deploymentPattern.test(origin)) {
+      return callback(null, true);
+    }
+    
+    console.log('CORS blocked origin:', origin);
+    callback(new Error('Not allowed by CORS'));
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
